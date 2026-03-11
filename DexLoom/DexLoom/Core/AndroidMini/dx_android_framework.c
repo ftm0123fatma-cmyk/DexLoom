@@ -2984,6 +2984,19 @@ static DxResult native_noop(DxVM *vm, DxFrame *frame, DxValue *args, uint32_t ar
     return DX_OK;
 }
 
+static DxResult native_system_loadlibrary_fw(DxVM *vm, DxFrame *frame, DxValue *args, uint32_t arg_count) {
+    (void)frame;
+    const char *lib_name = "(unknown)";
+    if (arg_count > 0 && args[0].tag == DX_VAL_OBJ && args[0].obj) {
+        const char *s = dx_vm_get_string_value(args[0].obj);
+        if (s) lib_name = s;
+    }
+    char feat_buf[160];
+    snprintf(feat_buf, sizeof(feat_buf), "System.loadLibrary(\"%s\") — native .so loading unsupported", lib_name);
+    dx_vm_report_missing_feature(vm, feat_buf);
+    return DX_OK;
+}
+
 static DxResult native_return_null(DxVM *vm, DxFrame *frame, DxValue *args, uint32_t arg_count) {
     (void)vm; (void)args; (void)arg_count;
     frame->result = DX_NULL_VALUE;
@@ -10640,6 +10653,619 @@ static DxResult native_jobinfo_builder_build(DxVM *vm, DxFrame *frame, DxValue *
     return DX_OK;
 }
 
+// ============================================================
+// Retrofit2: Real annotation-driven HTTP dispatch
+// ============================================================
+// Retrofit object fields (instance_field_count=2):
+//   [0] = base URL string object
+//   [1] = OkHttpClient object (optional)
+// Retrofit$Builder fields (instance_field_count=3):
+//   [0] = base URL string object
+//   [1] = OkHttpClient object
+//   [2] = converter factories (unused for now)
+
+// Retrofit$Builder.baseUrl(String) -> Builder
+static DxResult native_retrofit_builder_baseurl(DxVM *vm, DxFrame *frame, DxValue *args, uint32_t arg_count) {
+    (void)vm;
+    DxObject *self = (arg_count > 0 && args[0].tag == DX_VAL_OBJ) ? args[0].obj : NULL;
+    if (self && self->fields && self->klass && self->klass->instance_field_count >= 1 && arg_count > 1) {
+        if (args[1].tag == DX_VAL_OBJ && args[1].obj) {
+            self->fields[0] = args[1]; // store base URL string
+        }
+    }
+    frame->result = DX_OBJ_VALUE(self);
+    frame->has_result = true;
+    return DX_OK;
+}
+
+// Retrofit$Builder.client(OkHttpClient) -> Builder
+static DxResult native_retrofit_builder_client(DxVM *vm, DxFrame *frame, DxValue *args, uint32_t arg_count) {
+    (void)vm;
+    DxObject *self = (arg_count > 0 && args[0].tag == DX_VAL_OBJ) ? args[0].obj : NULL;
+    if (self && self->fields && self->klass && self->klass->instance_field_count >= 2 && arg_count > 1) {
+        self->fields[1] = args[1]; // store OkHttpClient
+    }
+    frame->result = DX_OBJ_VALUE(self);
+    frame->has_result = true;
+    return DX_OK;
+}
+
+// Retrofit$Builder.build() -> Retrofit
+static DxResult native_retrofit_builder_build(DxVM *vm, DxFrame *frame, DxValue *args, uint32_t arg_count) {
+    DxObject *self = (arg_count > 0 && args[0].tag == DX_VAL_OBJ) ? args[0].obj : NULL;
+    DxClass *retrofit_cls = dx_vm_find_class(vm, "Lretrofit2/Retrofit;");
+    if (!retrofit_cls) {
+        frame->result = DX_NULL_VALUE;
+        frame->has_result = true;
+        return DX_OK;
+    }
+    DxObject *retrofit = dx_vm_alloc_object(vm, retrofit_cls);
+    if (retrofit && retrofit->fields && retrofit->klass && self && self->fields && self->klass) {
+        // Copy base URL from builder field[0] to retrofit field[0]
+        if (self->klass->instance_field_count >= 1)
+            retrofit->fields[0] = self->fields[0];
+        // Copy OkHttpClient from builder field[1] to retrofit field[1]
+        if (self->klass->instance_field_count >= 2 && retrofit->klass->instance_field_count >= 2)
+            retrofit->fields[1] = self->fields[1];
+    }
+    dx_log_msg(DX_LOG_INFO, "Retrofit", "Retrofit.Builder.build() created Retrofit instance");
+    frame->result = retrofit ? DX_OBJ_VALUE(retrofit) : DX_NULL_VALUE;
+    frame->has_result = true;
+    return DX_OK;
+}
+
+// Helper: Check if a method has one of the Retrofit HTTP annotations and extract info
+// Returns the HTTP method string ("GET", "POST", etc.) or NULL if no annotation found
+// Sets *out_path to the annotation path value
+static const char *retrofit_get_http_annotation(DxMethod *method, const char **out_path) {
+    if (!method || !method->annotations || method->annotation_count == 0) return NULL;
+    static const struct {
+        const char *anno_type;
+        const char *http_method;
+    } http_annos[] = {
+        { "Lretrofit2/http/GET;",    "GET" },
+        { "Lretrofit2/http/POST;",   "POST" },
+        { "Lretrofit2/http/PUT;",    "PUT" },
+        { "Lretrofit2/http/DELETE;", "DELETE" },
+        { "Lretrofit2/http/PATCH;",  "PATCH" },
+        { "Lretrofit2/http/HEAD;",   "HEAD" },
+        { "Lretrofit2/http/OPTIONS;","OPTIONS" },
+        { "Lretrofit2/http/HTTP;",   NULL }, // uses method element
+    };
+    for (int i = 0; i < 8; i++) {
+        const DxAnnotationEntry *ann = dx_method_get_annotation(method, http_annos[i].anno_type);
+        if (ann) {
+            if (out_path) *out_path = dx_annotation_get_string(ann, "value");
+            if (http_annos[i].http_method) {
+                return http_annos[i].http_method;
+            }
+            // For @HTTP, read the "method" element
+            const char *m = dx_annotation_get_string(ann, "method");
+            return m ? m : "GET";
+        }
+    }
+    return NULL;
+}
+
+// Helper: perform URL path substitution for @Path parameters
+// E.g., "/users/{id}/repos" with param "id"="42" -> "/users/42/repos"
+static void retrofit_substitute_path(char *url, size_t url_size, const char *param_name, const char *param_value) {
+    if (!url || !param_name || !param_value) return;
+    char placeholder[128];
+    snprintf(placeholder, sizeof(placeholder), "{%s}", param_name);
+    char *pos = strstr(url, placeholder);
+    if (!pos) return;
+    size_t ph_len = strlen(placeholder);
+    size_t val_len = strlen(param_value);
+    size_t tail_len = strlen(pos + ph_len);
+    if ((pos - url) + val_len + tail_len >= url_size - 1) return; // overflow check
+    memmove(pos + val_len, pos + ph_len, tail_len + 1);
+    memcpy(pos, param_value, val_len);
+}
+
+// Helper: append a query parameter to URL
+static void retrofit_append_query(char *url, size_t url_size, const char *key, const char *value) {
+    if (!url || !key || !value) return;
+    size_t cur_len = strlen(url);
+    char sep = strchr(url, '?') ? '&' : '?';
+    size_t needed = cur_len + 1 + strlen(key) + 1 + strlen(value) + 1;
+    if (needed >= url_size) return;
+    char buf[512];
+    snprintf(buf, sizeof(buf), "%c%s=%s", sep, key, value);
+    strncat(url, buf, url_size - cur_len - 1);
+}
+
+// Helper: get string representation of a DxValue for request body/params
+static const char *retrofit_value_to_string(DxVM *vm, DxValue val) {
+    (void)vm;
+    if (val.tag == DX_VAL_OBJ && val.obj) {
+        const char *s = dx_vm_get_string_value(val.obj);
+        if (s) return s;
+        // Try toString
+        DxMethod *ts = dx_vm_find_method(val.obj->klass, "toString", NULL);
+        if (ts) {
+            DxValue ts_args[1] = { val };
+            DxValue ts_result = {0};
+            if (dx_vm_execute_method(vm, ts, ts_args, 1, &ts_result) == DX_OK &&
+                ts_result.tag == DX_VAL_OBJ && ts_result.obj) {
+                return dx_vm_get_string_value(ts_result.obj);
+            }
+        }
+        return "{}"; // fallback for body objects
+    }
+    return NULL;
+}
+
+// Retrofit proxy dispatch: called when a method is invoked on the retrofit proxy
+// The proxy stores: field[0] = base URL string, field[1] = interface DxClass*
+// frame->method = the DxMethod that was called (has annotations from the interface)
+static DxResult native_retrofit_proxy_dispatch(DxVM *vm, DxFrame *frame, DxValue *args, uint32_t arg_count) {
+    DxObject *proxy = (arg_count > 0 && args[0].tag == DX_VAL_OBJ) ? args[0].obj : NULL;
+    if (!proxy || !proxy->fields || !proxy->klass) {
+        frame->result = DX_NULL_VALUE;
+        frame->has_result = true;
+        return DX_OK;
+    }
+
+    // Get base URL from proxy field[0]
+    const char *base_url = "";
+    if (proxy->fields[0].tag == DX_VAL_OBJ && proxy->fields[0].obj) {
+        const char *s = dx_vm_get_string_value(proxy->fields[0].obj);
+        if (s) base_url = s;
+    }
+
+    // Get the called method (stored in frame->method by the dispatch mechanism)
+    DxMethod *called_method = frame->method;
+    if (!called_method) {
+        dx_log_msg(DX_LOG_WARN, "Retrofit", "Proxy dispatch: no method info");
+        frame->result = DX_NULL_VALUE;
+        frame->has_result = true;
+        return DX_OK;
+    }
+
+    // Check for HTTP annotation
+    const char *path = NULL;
+    const char *http_method = retrofit_get_http_annotation(called_method, &path);
+    if (!http_method) {
+        // No HTTP annotation — could be toString, hashCode, etc.
+        // Return null for unknown methods
+        dx_log_msg(DX_LOG_DEBUG, "Retrofit", "No HTTP annotation on method, returning null");
+        frame->result = DX_NULL_VALUE;
+        frame->has_result = true;
+        return DX_OK;
+    }
+
+    // Build full URL: base_url + path
+    char full_url[2048];
+    // Remove trailing slash from base URL if path starts with /
+    size_t base_len = strlen(base_url);
+    if (base_len > 0 && base_url[base_len - 1] == '/' && path && path[0] == '/') {
+        snprintf(full_url, sizeof(full_url), "%.*s%s", (int)(base_len - 1), base_url, path);
+    } else if (path && path[0] != '/' && base_len > 0 && base_url[base_len - 1] != '/') {
+        snprintf(full_url, sizeof(full_url), "%s/%s", base_url, path);
+    } else {
+        snprintf(full_url, sizeof(full_url), "%s%s", base_url, path ? path : "");
+    }
+
+    // Process parameter annotations: @Path, @Query, @Body, @Header
+    const char *body_str = NULL;
+    const char *h_names[DX_NET_MAX_HEADERS];
+    const char *h_values[DX_NET_MAX_HEADERS];
+    int h_count = 0;
+
+    // Parameters start at args[1] (args[0] is 'this' proxy)
+    for (uint32_t pi = 1; pi < arg_count && called_method->annotations; pi++) {
+        uint32_t param_idx = pi - 1; // 0-based parameter index
+        // Check each annotation on the method for parameter annotations
+        // Parameter annotations are stored differently — scan all annotations
+        for (uint32_t ai = 0; ai < called_method->annotation_count; ai++) {
+            DxAnnotationEntry *ann = &called_method->annotations[ai];
+            if (!ann->type) continue;
+
+            // @Path("name") — check if this annotation targets this parameter
+            // In DEX, parameter annotations are separate, but for framework methods
+            // we check by naming convention. For real DEX methods, parameter annotations
+            // are indexed. We use a heuristic: annotation order maps to param order.
+            if (strcmp(ann->type, "Lretrofit2/http/Path;") == 0) {
+                // Match annotation to parameter by index within Path annotations
+                static uint32_t path_idx_counter;
+                if (pi == 1) path_idx_counter = 0;
+                const char *param_name = dx_annotation_get_string(ann, "value");
+                if (param_name && path_idx_counter == param_idx) {
+                    const char *val = retrofit_value_to_string(vm, args[pi]);
+                    if (val) retrofit_substitute_path(full_url, sizeof(full_url), param_name, val);
+                }
+                path_idx_counter++;
+            }
+            if (strcmp(ann->type, "Lretrofit2/http/Query;") == 0) {
+                static uint32_t query_idx_counter;
+                if (pi == 1) query_idx_counter = 0;
+                const char *key = dx_annotation_get_string(ann, "value");
+                if (key && query_idx_counter == param_idx) {
+                    const char *val = retrofit_value_to_string(vm, args[pi]);
+                    if (val) retrofit_append_query(full_url, sizeof(full_url), key, val);
+                }
+                query_idx_counter++;
+            }
+            if (strcmp(ann->type, "Lretrofit2/http/Body;") == 0) {
+                body_str = retrofit_value_to_string(vm, args[pi]);
+            }
+            if (strcmp(ann->type, "Lretrofit2/http/Header;") == 0) {
+                static uint32_t header_idx_counter;
+                if (pi == 1) header_idx_counter = 0;
+                const char *hdr_name = dx_annotation_get_string(ann, "value");
+                if (hdr_name && header_idx_counter == param_idx && h_count < DX_NET_MAX_HEADERS) {
+                    const char *val = retrofit_value_to_string(vm, args[pi]);
+                    if (val) {
+                        h_names[h_count] = hdr_name;
+                        h_values[h_count] = val;
+                        h_count++;
+                    }
+                }
+                header_idx_counter++;
+            }
+        }
+    }
+
+    dx_log(DX_LOG_INFO, "Retrofit", "HTTP %s %s", http_method, full_url);
+
+    // Build network request
+    DxNetworkRequest req = {
+        .url = full_url,
+        .method = http_method,
+        .header_names = h_names,
+        .header_values = h_values,
+        .header_count = h_count,
+        .body = body_str ? (const uint8_t *)body_str : NULL,
+        .body_size = body_str ? strlen(body_str) : 0,
+    };
+    DxNetworkResponse net_resp;
+    memset(&net_resp, 0, sizeof(net_resp));
+
+    bool ok = dx_runtime_perform_network_request(&req, &net_resp);
+    int status = ok ? net_resp.status_code : 0;
+
+    // Create response body string
+    DxObject *body_string = NULL;
+    if (ok && net_resp.body && net_resp.body_size > 0) {
+        char *body_buf = (char *)dx_malloc(net_resp.body_size + 1);
+        if (body_buf) {
+            memcpy(body_buf, net_resp.body, net_resp.body_size);
+            body_buf[net_resp.body_size] = '\0';
+            body_string = dx_vm_create_string(vm, body_buf);
+            dx_free(body_buf);
+        }
+    } else {
+        body_string = dx_vm_create_string(vm, "{}");
+    }
+
+    dx_log(DX_LOG_INFO, "Retrofit", "Response: %d (%zu bytes)", status, ok ? net_resp.body_size : 0);
+
+    // Create retrofit2/Response object
+    DxClass *resp_cls = dx_vm_find_class(vm, "Lretrofit2/Response;");
+    DxObject *response = resp_cls ? dx_vm_alloc_object(vm, resp_cls) : NULL;
+    if (response && response->fields && response->klass) {
+        // Response fields: [0]=status code, [1]=body object (the deserialized body), [2]=raw body string
+        if (response->klass->instance_field_count >= 1)
+            response->fields[0] = DX_INT_VALUE(status);
+        if (response->klass->instance_field_count >= 2)
+            response->fields[1] = body_string ? DX_OBJ_VALUE(body_string) : DX_NULL_VALUE;
+        if (response->klass->instance_field_count >= 3)
+            response->fields[2] = body_string ? DX_OBJ_VALUE(body_string) : DX_NULL_VALUE;
+    }
+
+    if (ok) dx_network_response_free(&net_resp);
+
+    // Determine return type: if method returns Call<T>, wrap in Call; otherwise return Response
+    // Check shorty — 'L' return means object. We wrap in Call by default.
+    DxClass *call_cls = dx_vm_find_class(vm, "Lretrofit2/Call;");
+    DxObject *call = call_cls ? dx_vm_alloc_object(vm, call_cls) : NULL;
+    if (call && call->fields && call->klass) {
+        // Call fields: [0]=Response (pre-executed), [1]=Request info
+        if (call->klass->instance_field_count >= 1)
+            call->fields[0] = response ? DX_OBJ_VALUE(response) : DX_NULL_VALUE;
+    }
+
+    // Return Call object (wrapping the already-executed response)
+    frame->result = call ? DX_OBJ_VALUE(call) : (response ? DX_OBJ_VALUE(response) : DX_NULL_VALUE);
+    frame->has_result = true;
+    return DX_OK;
+}
+
+// Retrofit Call.execute() for retrofit-created calls (returns pre-fetched Response)
+static DxResult native_retrofit_call_execute(DxVM *vm, DxFrame *frame, DxValue *args, uint32_t arg_count) {
+    (void)vm;
+    DxObject *self = (arg_count > 0 && args[0].tag == DX_VAL_OBJ) ? args[0].obj : NULL;
+    if (self && self->fields && self->klass && self->klass->instance_field_count >= 1) {
+        // field[0] = pre-fetched Response
+        frame->result = self->fields[0];
+    } else {
+        frame->result = DX_NULL_VALUE;
+    }
+    frame->has_result = true;
+    return DX_OK;
+}
+
+// Retrofit Call.enqueue(Callback) for retrofit-created calls
+static DxResult native_retrofit_call_enqueue(DxVM *vm, DxFrame *frame, DxValue *args, uint32_t arg_count) {
+    DxObject *self = (arg_count > 0 && args[0].tag == DX_VAL_OBJ) ? args[0].obj : NULL;
+    DxObject *callback = (arg_count > 1 && args[1].tag == DX_VAL_OBJ) ? args[1].obj : NULL;
+
+    if (self && self->fields && self->klass && self->klass->instance_field_count >= 1 && callback) {
+        // Get pre-fetched response from field[0]
+        DxValue resp_val = self->fields[0];
+        if (callback->klass) {
+            DxMethod *on_resp = dx_vm_find_method(callback->klass, "onResponse", "VLL");
+            if (on_resp) {
+                DxValue cb_args[3] = { DX_OBJ_VALUE(callback), DX_OBJ_VALUE(self), resp_val };
+                DxValue cb_result = {0};
+                dx_vm_execute_method(vm, on_resp, cb_args, 3, &cb_result);
+            }
+        }
+    }
+    frame->result = DX_NULL_VALUE;
+    frame->has_result = true;
+    return DX_OK;
+}
+
+// Retrofit Response.body() -> returns deserialized body (stored in field[1])
+static DxResult native_retrofit_response_body(DxVM *vm, DxFrame *frame, DxValue *args, uint32_t arg_count) {
+    (void)vm;
+    DxObject *self = (arg_count > 0 && args[0].tag == DX_VAL_OBJ) ? args[0].obj : NULL;
+    if (self && self->fields && self->klass && self->klass->instance_field_count >= 2) {
+        frame->result = self->fields[1];
+    } else {
+        frame->result = DX_NULL_VALUE;
+    }
+    frame->has_result = true;
+    return DX_OK;
+}
+
+// Retrofit Response.code() -> returns status code (stored in field[0])
+static DxResult native_retrofit_response_code(DxVM *vm, DxFrame *frame, DxValue *args, uint32_t arg_count) {
+    (void)vm;
+    DxObject *self = (arg_count > 0 && args[0].tag == DX_VAL_OBJ) ? args[0].obj : NULL;
+    if (self && self->fields && self->klass && self->klass->instance_field_count >= 1 &&
+        self->fields[0].tag == DX_VAL_INT) {
+        frame->result = self->fields[0];
+    } else {
+        frame->result = DX_INT_VALUE(200);
+    }
+    frame->has_result = true;
+    return DX_OK;
+}
+
+// Retrofit Response.isSuccessful() -> status code in 200-299 range
+static DxResult native_retrofit_response_is_successful(DxVM *vm, DxFrame *frame, DxValue *args, uint32_t arg_count) {
+    (void)vm;
+    DxObject *self = (arg_count > 0 && args[0].tag == DX_VAL_OBJ) ? args[0].obj : NULL;
+    int code = 200;
+    if (self && self->fields && self->klass && self->klass->instance_field_count >= 1 &&
+        self->fields[0].tag == DX_VAL_INT) {
+        code = self->fields[0].i;
+    }
+    frame->result = DX_INT_VALUE((code >= 200 && code < 300) ? 1 : 0);
+    frame->has_result = true;
+    return DX_OK;
+}
+
+// Retrofit Response.errorBody() -> returns raw body string on error, null on success
+static DxResult native_retrofit_response_errorbody(DxVM *vm, DxFrame *frame, DxValue *args, uint32_t arg_count) {
+    (void)vm;
+    DxObject *self = (arg_count > 0 && args[0].tag == DX_VAL_OBJ) ? args[0].obj : NULL;
+    int code = 200;
+    if (self && self->fields && self->klass && self->klass->instance_field_count >= 1 &&
+        self->fields[0].tag == DX_VAL_INT) {
+        code = self->fields[0].i;
+    }
+    if (code < 200 || code >= 300) {
+        // Error — return body string as ResponseBody
+        if (self && self->fields && self->klass && self->klass->instance_field_count >= 3) {
+            frame->result = self->fields[2]; // raw body string
+        } else {
+            frame->result = DX_NULL_VALUE;
+        }
+    } else {
+        frame->result = DX_NULL_VALUE;
+    }
+    frame->has_result = true;
+    return DX_OK;
+}
+
+// Retrofit Response.raw() -> return an OkHttp Response-like wrapper
+static DxResult native_retrofit_response_raw(DxVM *vm, DxFrame *frame, DxValue *args, uint32_t arg_count) {
+    (void)arg_count;
+    DxObject *self = (args[0].tag == DX_VAL_OBJ) ? args[0].obj : NULL;
+    DxClass *okhttp_resp_cls = dx_vm_find_class(vm, "Lokhttp3/Response;");
+    DxObject *raw = okhttp_resp_cls ? dx_vm_alloc_object(vm, okhttp_resp_cls) : NULL;
+    if (raw && raw->fields && raw->klass && self && self->fields && self->klass) {
+        if (raw->klass->instance_field_count >= 1 && self->klass->instance_field_count >= 1)
+            raw->fields[0] = self->fields[0]; // status code
+    }
+    frame->result = raw ? DX_OBJ_VALUE(raw) : DX_NULL_VALUE;
+    frame->has_result = true;
+    return DX_OK;
+}
+
+// Retrofit.create(Class) -> creates a dynamic proxy that dispatches HTTP calls
+static DxResult native_retrofit_create(DxVM *vm, DxFrame *frame, DxValue *args, uint32_t arg_count) {
+    DxObject *self = (arg_count > 0 && args[0].tag == DX_VAL_OBJ) ? args[0].obj : NULL;
+    DxObject *iface_class_obj = (arg_count > 1 && args[1].tag == DX_VAL_OBJ) ? args[1].obj : NULL;
+
+    if (!self || !self->fields || !self->klass) {
+        frame->result = DX_NULL_VALUE;
+        frame->has_result = true;
+        return DX_OK;
+    }
+
+    // Get base URL from Retrofit field[0]
+    const char *base_url = "";
+    if (self->klass->instance_field_count >= 1 &&
+        self->fields[0].tag == DX_VAL_OBJ && self->fields[0].obj) {
+        const char *s = dx_vm_get_string_value(self->fields[0].obj);
+        if (s) base_url = s;
+    }
+
+    // Extract the interface DxClass from the Class object
+    DxClass *iface = NULL;
+    if (iface_class_obj) {
+        // Try field[0] as pointer (Class object pattern)
+        if (iface_class_obj->fields && iface_class_obj->klass &&
+            iface_class_obj->klass->instance_field_count > 0 &&
+            iface_class_obj->fields[0].tag == DX_VAL_INT && iface_class_obj->fields[0].i != 0) {
+            iface = (DxClass *)(uintptr_t)iface_class_obj->fields[0].i;
+        }
+        if (!iface) {
+            // Maybe the object itself is the class wrapper
+            iface = iface_class_obj->klass;
+        }
+    }
+
+    if (!iface) {
+        dx_log_msg(DX_LOG_WARN, "Retrofit", "create(): could not resolve interface class");
+        frame->result = DX_NULL_VALUE;
+        frame->has_result = true;
+        return DX_OK;
+    }
+
+    dx_log(DX_LOG_INFO, "Retrofit", "create() for interface: %s, baseUrl: %s",
+           iface->descriptor ? iface->descriptor : "?", base_url);
+
+    // Create a dynamic proxy class for this interface
+    char proxy_desc[128];
+    static int retrofit_proxy_counter = 0;
+    snprintf(proxy_desc, sizeof(proxy_desc), "L$RetrofitProxy%d;", retrofit_proxy_counter++);
+
+    DxClass *proxy_cls = (DxClass *)dx_malloc(sizeof(DxClass));
+    if (!proxy_cls) {
+        frame->result = DX_NULL_VALUE;
+        frame->has_result = true;
+        return DX_OK;
+    }
+    memset(proxy_cls, 0, sizeof(DxClass));
+    proxy_cls->descriptor = dx_strdup(proxy_desc);
+    proxy_cls->super_class = vm->class_object;
+    proxy_cls->status = DX_CLASS_INITIALIZED;
+    proxy_cls->is_framework = true;
+    proxy_cls->instance_field_count = 2; // [0]=base URL, [1]=interface class ptr
+
+    // Set interface
+    proxy_cls->interface_count = 1;
+    proxy_cls->interfaces = (const char **)dx_malloc(sizeof(char *));
+    if (proxy_cls->interfaces)
+        proxy_cls->interfaces[0] = iface->descriptor;
+
+    // Copy all virtual methods from the interface, wiring them to our dispatch
+    for (uint32_t mi = 0; mi < iface->virtual_method_count; mi++) {
+        DxMethod *im = &iface->virtual_methods[mi];
+        uint32_t idx = proxy_cls->virtual_method_count;
+        DxMethod *new_methods = (DxMethod *)dx_realloc(proxy_cls->virtual_methods,
+            sizeof(DxMethod) * (idx + 1));
+        if (!new_methods) continue;
+        memset(&new_methods[idx], 0, sizeof(DxMethod));
+        new_methods[idx].name = im->name;
+        new_methods[idx].shorty = im->shorty;
+        new_methods[idx].declaring_class = proxy_cls;
+        new_methods[idx].access_flags = DX_ACC_PUBLIC;
+        new_methods[idx].native_fn = native_retrofit_proxy_dispatch;
+        new_methods[idx].is_native = true;
+        new_methods[idx].vtable_idx = (int32_t)idx;
+        // Copy annotations from the interface method so we can read @GET/@POST etc.
+        new_methods[idx].annotations = im->annotations;
+        new_methods[idx].annotation_count = im->annotation_count;
+        proxy_cls->virtual_methods = new_methods;
+        proxy_cls->virtual_method_count = idx + 1;
+    }
+
+    // Also copy direct methods (static methods on the interface)
+    for (uint32_t mi = 0; mi < iface->direct_method_count; mi++) {
+        DxMethod *im = &iface->direct_methods[mi];
+        // Skip <init> and <clinit>
+        if (im->name && (strcmp(im->name, "<init>") == 0 || strcmp(im->name, "<clinit>") == 0))
+            continue;
+        uint32_t idx = proxy_cls->virtual_method_count;
+        DxMethod *new_methods = (DxMethod *)dx_realloc(proxy_cls->virtual_methods,
+            sizeof(DxMethod) * (idx + 1));
+        if (!new_methods) continue;
+        memset(&new_methods[idx], 0, sizeof(DxMethod));
+        new_methods[idx].name = im->name;
+        new_methods[idx].shorty = im->shorty;
+        new_methods[idx].declaring_class = proxy_cls;
+        new_methods[idx].access_flags = DX_ACC_PUBLIC;
+        new_methods[idx].native_fn = native_retrofit_proxy_dispatch;
+        new_methods[idx].is_native = true;
+        new_methods[idx].vtable_idx = (int32_t)idx;
+        new_methods[idx].annotations = im->annotations;
+        new_methods[idx].annotation_count = im->annotation_count;
+        proxy_cls->virtual_methods = new_methods;
+        proxy_cls->virtual_method_count = idx + 1;
+    }
+
+    // Register proxy class in VM
+    if (vm->class_count < DX_MAX_CLASSES) {
+        vm->classes[vm->class_count++] = proxy_cls;
+        dx_vm_class_hash_insert(vm, proxy_cls);
+    }
+
+    // Allocate the proxy object
+    DxObject *proxy = dx_vm_alloc_object(vm, proxy_cls);
+    if (proxy && proxy->fields) {
+        // Store base URL in field[0]
+        DxObject *url_str = dx_vm_create_string(vm, base_url);
+        proxy->fields[0] = url_str ? DX_OBJ_VALUE(url_str) : DX_NULL_VALUE;
+        // Store interface class pointer in field[1] for debugging
+        proxy->fields[1].tag = DX_VAL_INT;
+        proxy->fields[1].i = (int32_t)(uintptr_t)iface;
+    }
+
+    frame->result = proxy ? DX_OBJ_VALUE(proxy) : DX_NULL_VALUE;
+    frame->has_result = true;
+    return DX_OK;
+}
+
+// Retrofit.baseUrl() -> returns base URL string
+static DxResult native_retrofit_baseurl(DxVM *vm, DxFrame *frame, DxValue *args, uint32_t arg_count) {
+    (void)vm;
+    DxObject *self = (arg_count > 0 && args[0].tag == DX_VAL_OBJ) ? args[0].obj : NULL;
+    if (self && self->fields && self->klass && self->klass->instance_field_count >= 1) {
+        frame->result = self->fields[0];
+    } else {
+        frame->result = DX_NULL_VALUE;
+    }
+    frame->has_result = true;
+    return DX_OK;
+}
+
+// Retrofit Response.success(T body) -> creates a successful Response wrapping body
+static DxResult native_retrofit_response_success(DxVM *vm, DxFrame *frame, DxValue *args, uint32_t arg_count) {
+    DxClass *resp_cls = dx_vm_find_class(vm, "Lretrofit2/Response;");
+    DxObject *response = resp_cls ? dx_vm_alloc_object(vm, resp_cls) : NULL;
+    if (response && response->fields && response->klass) {
+        if (response->klass->instance_field_count >= 1)
+            response->fields[0] = DX_INT_VALUE(200);
+        if (response->klass->instance_field_count >= 2 && arg_count > 0)
+            response->fields[1] = args[0]; // body
+    }
+    frame->result = response ? DX_OBJ_VALUE(response) : DX_NULL_VALUE;
+    frame->has_result = true;
+    return DX_OK;
+}
+
+// Retrofit Response.error(int code, ResponseBody body) -> error response
+static DxResult native_retrofit_response_error(DxVM *vm, DxFrame *frame, DxValue *args, uint32_t arg_count) {
+    DxClass *resp_cls = dx_vm_find_class(vm, "Lretrofit2/Response;");
+    DxObject *response = resp_cls ? dx_vm_alloc_object(vm, resp_cls) : NULL;
+    if (response && response->fields && response->klass) {
+        if (response->klass->instance_field_count >= 1 && arg_count > 0)
+            response->fields[0] = args[0]; // code
+        if (response->klass->instance_field_count >= 2 && arg_count > 1)
+            response->fields[1] = args[1]; // error body
+    }
+    frame->result = response ? DX_OBJ_VALUE(response) : DX_NULL_VALUE;
+    frame->has_result = true;
+    return DX_OK;
+}
+
 DxResult dx_register_android_framework(DxVM *vm) {
     if (!vm) return DX_ERR_NULL_PTR;
 
@@ -16288,6 +16914,10 @@ DxResult dx_register_android_framework(DxVM *vm) {
                native_noop, true);
     add_method(system_cls, "getProperty", "LL", DX_ACC_PUBLIC | DX_ACC_STATIC,
                native_return_null, true);
+    add_method(system_cls, "loadLibrary", "VL", DX_ACC_PUBLIC | DX_ACC_STATIC,
+               native_system_loadlibrary_fw, true);
+    add_method(system_cls, "load", "VL", DX_ACC_PUBLIC | DX_ACC_STATIC,
+               native_system_loadlibrary_fw, true);
 
     DxClass *arrays_cls = reg_class(vm, "Ljava/util/Arrays;", obj);
     add_method(arrays_cls, "asList", "LL", DX_ACC_PUBLIC | DX_ACC_STATIC,
@@ -17528,22 +18158,24 @@ DxResult dx_register_android_framework(DxVM *vm) {
     DxClass *okhttp_logging_level = reg_class(vm, "Lokhttp3/logging/HttpLoggingInterceptor$Level;", obj);
     add_method(okhttp_logging_level, "values", "L", DX_ACC_PUBLIC | DX_ACC_STATIC, native_return_null, true);
 
-    // --- Retrofit2 stubs (com.squareup.retrofit2) ---
+    // --- Retrofit2: Real annotation-driven HTTP dispatch (com.squareup.retrofit2) ---
     DxClass *retrofit_cls = reg_class(vm, "Lretrofit2/Retrofit;", obj);
-    add_method(retrofit_cls, "create", "LL", DX_ACC_PUBLIC, native_return_null, false);
-    add_method(retrofit_cls, "baseUrl", "L", DX_ACC_PUBLIC, native_return_null, false);
+    retrofit_cls->instance_field_count = 2; // [0]=base URL string, [1]=OkHttpClient
+    add_method(retrofit_cls, "create", "LL", DX_ACC_PUBLIC, native_retrofit_create, false);
+    add_method(retrofit_cls, "baseUrl", "L", DX_ACC_PUBLIC, native_retrofit_baseurl, false);
     add_method(retrofit_cls, "callFactory", "L", DX_ACC_PUBLIC, native_return_null, false);
     add_method(retrofit_cls, "converterFactories", "L", DX_ACC_PUBLIC, native_return_null, false);
     add_method(retrofit_cls, "callAdapterFactories", "L", DX_ACC_PUBLIC, native_return_null, false);
     add_method(retrofit_cls, "newBuilder", "L", DX_ACC_PUBLIC, native_return_null, false);
 
     DxClass *retrofit_builder = reg_class(vm, "Lretrofit2/Retrofit$Builder;", obj);
+    retrofit_builder->instance_field_count = 3; // [0]=base URL, [1]=OkHttpClient, [2]=converters
     add_method(retrofit_builder, "<init>", "V", DX_ACC_PUBLIC | DX_ACC_CONSTRUCTOR, native_noop, false);
-    add_method(retrofit_builder, "baseUrl", "LL", DX_ACC_PUBLIC, native_return_self, false);
-    add_method(retrofit_builder, "client", "LL", DX_ACC_PUBLIC, native_return_self, false);
+    add_method(retrofit_builder, "baseUrl", "LL", DX_ACC_PUBLIC, native_retrofit_builder_baseurl, false);
+    add_method(retrofit_builder, "client", "LL", DX_ACC_PUBLIC, native_retrofit_builder_client, false);
     add_method(retrofit_builder, "addConverterFactory", "LL", DX_ACC_PUBLIC, native_return_self, false);
     add_method(retrofit_builder, "addCallAdapterFactory", "LL", DX_ACC_PUBLIC, native_return_self, false);
-    add_method(retrofit_builder, "build", "L", DX_ACC_PUBLIC, native_return_null, false);
+    add_method(retrofit_builder, "build", "L", DX_ACC_PUBLIC, native_retrofit_builder_build, false);
     add_method(retrofit_builder, "callFactory", "LL", DX_ACC_PUBLIC, native_return_self, false);
     add_method(retrofit_builder, "callbackExecutor", "LL", DX_ACC_PUBLIC, native_return_self, false);
     add_method(retrofit_builder, "validateEagerly", "LZ", DX_ACC_PUBLIC, native_return_self, false);
@@ -17562,10 +18194,11 @@ DxResult dx_register_android_framework(DxVM *vm) {
 
     DxClass *retrofit_call = reg_class(vm, "Lretrofit2/Call;", obj);
     retrofit_call->access_flags = DX_ACC_INTERFACE | DX_ACC_ABSTRACT;
-    add_method(retrofit_call, "execute", "L", DX_ACC_PUBLIC, native_return_null, false);
-    add_method(retrofit_call, "enqueue", "VL", DX_ACC_PUBLIC, native_noop, false);
+    retrofit_call->instance_field_count = 2; // [0]=Response (pre-fetched), [1]=Request info
+    add_method(retrofit_call, "execute", "L", DX_ACC_PUBLIC, native_retrofit_call_execute, false);
+    add_method(retrofit_call, "enqueue", "VL", DX_ACC_PUBLIC, native_retrofit_call_enqueue, false);
     add_method(retrofit_call, "cancel", "V", DX_ACC_PUBLIC, native_noop, false);
-    add_method(retrofit_call, "clone", "L", DX_ACC_PUBLIC, native_return_null, false);
+    add_method(retrofit_call, "clone", "L", DX_ACC_PUBLIC, native_return_self, false);
     add_method(retrofit_call, "isExecuted", "Z", DX_ACC_PUBLIC, native_return_false, false);
     add_method(retrofit_call, "isCanceled", "Z", DX_ACC_PUBLIC, native_return_false, false);
     add_method(retrofit_call, "request", "L", DX_ACC_PUBLIC, native_return_null, false);
@@ -17576,15 +18209,16 @@ DxResult dx_register_android_framework(DxVM *vm) {
     add_method(retrofit_callback, "onFailure", "VLL", DX_ACC_PUBLIC, native_noop, false);
 
     DxClass *retrofit_response = reg_class(vm, "Lretrofit2/Response;", obj);
-    add_method(retrofit_response, "body", "L", DX_ACC_PUBLIC, native_return_null, false);
-    add_method(retrofit_response, "code", "I", DX_ACC_PUBLIC, native_return_int_200, false);
-    add_method(retrofit_response, "isSuccessful", "Z", DX_ACC_PUBLIC, native_return_true, false);
-    add_method(retrofit_response, "errorBody", "L", DX_ACC_PUBLIC, native_return_null, false);
+    retrofit_response->instance_field_count = 3; // [0]=status code, [1]=body obj, [2]=raw body string
+    add_method(retrofit_response, "body", "L", DX_ACC_PUBLIC, native_retrofit_response_body, false);
+    add_method(retrofit_response, "code", "I", DX_ACC_PUBLIC, native_retrofit_response_code, false);
+    add_method(retrofit_response, "isSuccessful", "Z", DX_ACC_PUBLIC, native_retrofit_response_is_successful, false);
+    add_method(retrofit_response, "errorBody", "L", DX_ACC_PUBLIC, native_retrofit_response_errorbody, false);
     add_method(retrofit_response, "message", "L", DX_ACC_PUBLIC, native_return_null, false);
     add_method(retrofit_response, "headers", "L", DX_ACC_PUBLIC, native_return_null, false);
-    add_method(retrofit_response, "raw", "L", DX_ACC_PUBLIC, native_return_null, false);
-    add_method(retrofit_response, "success", "LL", DX_ACC_PUBLIC | DX_ACC_STATIC, native_return_null, true);
-    add_method(retrofit_response, "error", "LIL", DX_ACC_PUBLIC | DX_ACC_STATIC, native_return_null, true);
+    add_method(retrofit_response, "raw", "L", DX_ACC_PUBLIC, native_retrofit_response_raw, false);
+    add_method(retrofit_response, "success", "LL", DX_ACC_PUBLIC | DX_ACC_STATIC, native_retrofit_response_success, true);
+    add_method(retrofit_response, "error", "LIL", DX_ACC_PUBLIC | DX_ACC_STATIC, native_retrofit_response_error, true);
 
     // Gson converter (most common Retrofit converter)
     DxClass *gson_converter = reg_class(vm, "Lretrofit2/converter/gson/GsonConverterFactory;", retrofit_converter_factory);
@@ -17609,6 +18243,98 @@ DxResult dx_register_android_framework(DxVM *vm) {
     DxClass *rx2_calladapter = reg_class(vm, "Lretrofit2/adapter/rxjava2/RxJava2CallAdapterFactory;", retrofit_calladapter_factory);
     add_method(rx2_calladapter, "create", "L", DX_ACC_PUBLIC | DX_ACC_STATIC, native_return_null, true);
     add_method(rx2_calladapter, "createAsync", "L", DX_ACC_PUBLIC | DX_ACC_STATIC, native_return_null, true);
+
+    // --- Retrofit2 HTTP annotation classes ---
+    // These are annotation types used in interface method declarations
+    DxClass *anno_base = dx_vm_find_class(vm, "Ljava/lang/annotation/Annotation;");
+    if (!anno_base) anno_base = obj;
+
+    DxClass *retrofit_get_anno = reg_class(vm, "Lretrofit2/http/GET;", anno_base);
+    retrofit_get_anno->access_flags = DX_ACC_INTERFACE | DX_ACC_ABSTRACT;
+    retrofit_get_anno->instance_field_count = 1;
+    add_method(retrofit_get_anno, "value", "L", DX_ACC_PUBLIC, native_return_null, false);
+
+    DxClass *retrofit_post_anno = reg_class(vm, "Lretrofit2/http/POST;", anno_base);
+    retrofit_post_anno->access_flags = DX_ACC_INTERFACE | DX_ACC_ABSTRACT;
+    retrofit_post_anno->instance_field_count = 1;
+    add_method(retrofit_post_anno, "value", "L", DX_ACC_PUBLIC, native_return_null, false);
+
+    DxClass *retrofit_put_anno = reg_class(vm, "Lretrofit2/http/PUT;", anno_base);
+    retrofit_put_anno->access_flags = DX_ACC_INTERFACE | DX_ACC_ABSTRACT;
+    retrofit_put_anno->instance_field_count = 1;
+    add_method(retrofit_put_anno, "value", "L", DX_ACC_PUBLIC, native_return_null, false);
+
+    DxClass *retrofit_delete_anno = reg_class(vm, "Lretrofit2/http/DELETE;", anno_base);
+    retrofit_delete_anno->access_flags = DX_ACC_INTERFACE | DX_ACC_ABSTRACT;
+    retrofit_delete_anno->instance_field_count = 1;
+    add_method(retrofit_delete_anno, "value", "L", DX_ACC_PUBLIC, native_return_null, false);
+
+    DxClass *retrofit_patch_anno = reg_class(vm, "Lretrofit2/http/PATCH;", anno_base);
+    retrofit_patch_anno->access_flags = DX_ACC_INTERFACE | DX_ACC_ABSTRACT;
+    retrofit_patch_anno->instance_field_count = 1;
+    add_method(retrofit_patch_anno, "value", "L", DX_ACC_PUBLIC, native_return_null, false);
+
+    DxClass *retrofit_head_anno = reg_class(vm, "Lretrofit2/http/HEAD;", anno_base);
+    retrofit_head_anno->access_flags = DX_ACC_INTERFACE | DX_ACC_ABSTRACT;
+    retrofit_head_anno->instance_field_count = 1;
+    add_method(retrofit_head_anno, "value", "L", DX_ACC_PUBLIC, native_return_null, false);
+
+    DxClass *retrofit_options_anno = reg_class(vm, "Lretrofit2/http/OPTIONS;", anno_base);
+    retrofit_options_anno->access_flags = DX_ACC_INTERFACE | DX_ACC_ABSTRACT;
+    retrofit_options_anno->instance_field_count = 1;
+    add_method(retrofit_options_anno, "value", "L", DX_ACC_PUBLIC, native_return_null, false);
+
+    DxClass *retrofit_http_anno = reg_class(vm, "Lretrofit2/http/HTTP;", anno_base);
+    retrofit_http_anno->access_flags = DX_ACC_INTERFACE | DX_ACC_ABSTRACT;
+    retrofit_http_anno->instance_field_count = 2;
+    add_method(retrofit_http_anno, "method", "L", DX_ACC_PUBLIC, native_return_null, false);
+    add_method(retrofit_http_anno, "path", "L", DX_ACC_PUBLIC, native_return_null, false);
+
+    DxClass *retrofit_path_anno = reg_class(vm, "Lretrofit2/http/Path;", anno_base);
+    retrofit_path_anno->access_flags = DX_ACC_INTERFACE | DX_ACC_ABSTRACT;
+    retrofit_path_anno->instance_field_count = 1;
+    add_method(retrofit_path_anno, "value", "L", DX_ACC_PUBLIC, native_return_null, false);
+
+    DxClass *retrofit_query_anno = reg_class(vm, "Lretrofit2/http/Query;", anno_base);
+    retrofit_query_anno->access_flags = DX_ACC_INTERFACE | DX_ACC_ABSTRACT;
+    retrofit_query_anno->instance_field_count = 1;
+    add_method(retrofit_query_anno, "value", "L", DX_ACC_PUBLIC, native_return_null, false);
+
+    DxClass *retrofit_body_anno = reg_class(vm, "Lretrofit2/http/Body;", anno_base);
+    retrofit_body_anno->access_flags = DX_ACC_INTERFACE | DX_ACC_ABSTRACT;
+
+    DxClass *retrofit_header_anno = reg_class(vm, "Lretrofit2/http/Header;", anno_base);
+    retrofit_header_anno->access_flags = DX_ACC_INTERFACE | DX_ACC_ABSTRACT;
+    retrofit_header_anno->instance_field_count = 1;
+    add_method(retrofit_header_anno, "value", "L", DX_ACC_PUBLIC, native_return_null, false);
+
+    DxClass *retrofit_field_anno = reg_class(vm, "Lretrofit2/http/Field;", anno_base);
+    retrofit_field_anno->access_flags = DX_ACC_INTERFACE | DX_ACC_ABSTRACT;
+    retrofit_field_anno->instance_field_count = 1;
+    add_method(retrofit_field_anno, "value", "L", DX_ACC_PUBLIC, native_return_null, false);
+
+    DxClass *retrofit_querymap_anno = reg_class(vm, "Lretrofit2/http/QueryMap;", anno_base);
+    retrofit_querymap_anno->access_flags = DX_ACC_INTERFACE | DX_ACC_ABSTRACT;
+
+    DxClass *retrofit_fieldmap_anno = reg_class(vm, "Lretrofit2/http/FieldMap;", anno_base);
+    retrofit_fieldmap_anno->access_flags = DX_ACC_INTERFACE | DX_ACC_ABSTRACT;
+
+    DxClass *retrofit_url_anno = reg_class(vm, "Lretrofit2/http/Url;", anno_base);
+    retrofit_url_anno->access_flags = DX_ACC_INTERFACE | DX_ACC_ABSTRACT;
+
+    DxClass *retrofit_headers_anno = reg_class(vm, "Lretrofit2/http/Headers;", anno_base);
+    retrofit_headers_anno->access_flags = DX_ACC_INTERFACE | DX_ACC_ABSTRACT;
+    retrofit_headers_anno->instance_field_count = 1;
+    add_method(retrofit_headers_anno, "value", "L", DX_ACC_PUBLIC, native_return_null, false);
+
+    DxClass *retrofit_formurlencoded_anno = reg_class(vm, "Lretrofit2/http/FormUrlEncoded;", anno_base);
+    retrofit_formurlencoded_anno->access_flags = DX_ACC_INTERFACE | DX_ACC_ABSTRACT;
+
+    DxClass *retrofit_multipart_anno = reg_class(vm, "Lretrofit2/http/Multipart;", anno_base);
+    retrofit_multipart_anno->access_flags = DX_ACC_INTERFACE | DX_ACC_ABSTRACT;
+
+    DxClass *retrofit_streaming_anno = reg_class(vm, "Lretrofit2/http/Streaming;", anno_base);
+    retrofit_streaming_anno->access_flags = DX_ACC_INTERFACE | DX_ACC_ABSTRACT;
 
     // --- Glide stubs (com.bumptech.glide) ---
     DxClass *glide_cls = reg_class(vm, "Lcom/bumptech/glide/Glide;", obj);

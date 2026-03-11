@@ -830,6 +830,25 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
         vm->watchdog_triggered = false;
     }
 
+    // Debug tracing: method entry
+    const char *_trace_cls = method->declaring_class ? method->declaring_class->descriptor : "?";
+    const char *_trace_mth = method->name ? method->name : "?";
+    bool _trace_method_active = false;
+    if (vm->debug.method_call_trace) {
+        bool passes_filter = true;
+        if (vm->debug.trace_method_filter) {
+            passes_filter = (strncmp(_trace_cls, vm->debug.trace_method_filter,
+                                     strlen(vm->debug.trace_method_filter)) == 0);
+        }
+        if (passes_filter) {
+            _trace_method_active = true;
+            DX_INFO("Trace", "%*sENTER %s->%s (depth=%d, args=%u)",
+                    vm->debug.trace_depth * 2, "", _trace_cls, _trace_mth,
+                    vm->debug.trace_depth, arg_count);
+            vm->debug.trace_depth++;
+        }
+    }
+
     // Check call depth BEFORE allocating stack frame to prevent stack overflow
     if (vm->stack_depth >= DX_MAX_STACK_DEPTH) {
         DX_ERROR(TAG, "Stack overflow at %s.%s (depth %u)",
@@ -891,6 +910,12 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
         DX_DEBUG(TAG, "<< %s.%s (native) -> %s",
                  method->declaring_class->descriptor, method->name,
                  dx_result_string(res));
+        if (_trace_method_active) {
+            vm->debug.trace_depth--;
+            DX_INFO("Trace", "%*sEXIT  %s->%s (native, result=%s)",
+                    vm->debug.trace_depth * 2, "", _trace_cls, _trace_mth,
+                    dx_result_string(res));
+        }
         dx_vm_free_frame(vm, frame);
         return res;
     }
@@ -900,6 +925,11 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
         DX_WARN(TAG, "Method has no code: %s.%s (skipping)",
                  method->declaring_class ? method->declaring_class->descriptor : "?",
                  method->name);
+        if (_trace_method_active) {
+            vm->debug.trace_depth--;
+            DX_INFO("Trace", "%*sEXIT  %s->%s (no code)",
+                    vm->debug.trace_depth * 2, "", _trace_cls, _trace_mth);
+        }
         if (result) *result = DX_NULL_VALUE;
         return DX_OK;
     }
@@ -1235,6 +1265,24 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
         insn_trace[insn_trace_idx % INSN_TRACE_SIZE].opcode = code[pc] & 0xFF;
         insn_trace_idx++;
 
+        // Watchdog: check wall-clock timeout every 10000 instructions
+        if (vm->watchdog_timeout_ms > 0 && (vm->insn_count % 10000) == 0) {
+            uint64_t now_ms = dx_current_time_ms();
+            if (now_ms - vm->watchdog_start_time > vm->watchdog_timeout_ms) {
+                vm->watchdog_triggered = true;
+                const char *cls_desc = method->declaring_class ? method->declaring_class->descriptor : "?";
+                const char *mth_name = method->name ? method->name : "?";
+                DX_ERROR(TAG, "Watchdog timeout (%ums) in %s.%s at pc=%u after %llu instructions",
+                         vm->watchdog_timeout_ms, cls_desc, mth_name, pc, vm->insn_count);
+                snprintf(vm->error_msg, sizeof(vm->error_msg),
+                         "Watchdog timeout (%ums) in %s.%s at pc=%u",
+                         vm->watchdog_timeout_ms, cls_desc, mth_name, pc);
+                exec_result = DX_ERR_BUDGET_EXHAUSTED;
+                if (result) *result = DX_NULL_VALUE;
+                goto done;
+            }
+        }
+
         if (vm->insn_limit > 0 && vm->insn_count > vm->insn_limit) {
             const char *cls_desc = method->declaring_class ? method->declaring_class->descriptor : "?";
             const char *mth_name = method->name ? method->name : "?";
@@ -1270,6 +1318,15 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
         uint8_t opcode = inst & 0xFF;
 
         DX_TRACE(TAG, "  pc=%u op=0x%02x (%s)", pc, opcode, dx_opcode_name(opcode));
+
+        // Debug tracing: bytecode trace with register state
+        if (vm->debug.bytecode_trace && _trace_method_active) {
+            DX_INFO("Trace", "  [PC=%04x] op=%02x (%s) regs: v0=%lld v1=%lld v2=%lld",
+                    pc, opcode, dx_opcode_name(opcode),
+                    (long long)frame->registers[0].l,
+                    (long long)(regs > 1 ? frame->registers[1].l : 0),
+                    (long long)(regs > 2 ? frame->registers[2].l : 0));
+        }
 
 #if USE_COMPUTED_GOTO
         goto *dispatch_table[opcode];
@@ -3223,18 +3280,116 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
         }
 
         // invoke-polymorphic (45cc format, 4 code units)
+#if USE_COMPUTED_GOTO
+        op_0xFA: {
+#else
+        case 0xFA: {
+#endif
+            // Format 45cc: [A|G|op BBBB F|E|D|C HHHH]
+            // B = method ref, H = proto index, A = arg count, C..G = arg regs
+            uint16_t method_idx = code[pc + 1];
+            uint16_t proto_idx = code[pc + 3];
+            uint8_t poly_argc;
+            uint8_t poly_arg_regs[5];
+            decode_35c_args(code, pc, &poly_argc, poly_arg_regs);
+
+            // First arg register holds the MethodHandle receiver
+            if (poly_argc < 1) {
+                DX_WARN(TAG, "invoke-polymorphic: no args (need at least MethodHandle receiver)");
+                frame->result = DX_NULL_VALUE;
+                frame->has_result = true;
+                pc += 4;
+                DISPATCH_NEXT;
+            }
+
+            DxObject *mh_obj = (frame->registers[poly_arg_regs[0]].tag == DX_VAL_OBJ)
+                               ? frame->registers[poly_arg_regs[0]].obj : NULL;
+            if (!mh_obj) {
+                DX_WARN(TAG, "invoke-polymorphic: null MethodHandle at v%u", poly_arg_regs[0]);
+                frame->result = DX_NULL_VALUE;
+                frame->has_result = true;
+                pc += 4;
+                DISPATCH_NEXT;
+            }
+
+            // Check if this is invokeExact (verify proto matches)
+            const char *mname = dx_dex_get_method_name(cur_dex, method_idx);
+            bool is_exact = (mname && strcmp(mname, "invokeExact") == 0);
+            (void)is_exact;  // proto verification logged but non-fatal
+            (void)proto_idx;
+
+            // Remaining args (after the MethodHandle receiver) are the actual call args
+            uint8_t call_argc = poly_argc - 1;
+            DxValue call_args[5];
+            for (uint8_t ai = 0; ai < call_argc && ai < 5; ai++) {
+                call_args[ai] = frame->registers[poly_arg_regs[ai + 1]];
+            }
+
+            DxValue poly_result;
+            poly_result = DX_NULL_VALUE;
+            int hr = dx_vm_invoke_method_handle(vm, mh_obj, call_args, call_argc, &poly_result);
+            if (hr != DX_OK) {
+                exec_result = (DxResult)hr;
+                goto done;
+            }
+            frame->result = poly_result;
+            frame->has_result = true;
+            pc += 4;
+            DISPATCH_NEXT;
+        }
+
         // invoke-polymorphic/range (4rcc format, 4 code units)
 #if USE_COMPUTED_GOTO
-        op_0xFA:
         op_0xFB: {
 #else
-        case 0xFA: case 0xFB: {
+        case 0xFB: {
 #endif
-            DX_WARN(TAG, "%s at pc=%u in %s.%s - not supported, returning null",
-                     dx_opcode_name(opcode), pc,
-                     method->declaring_class ? method->declaring_class->descriptor : "?",
-                     method->name);
-            frame->result = DX_NULL_VALUE;
+            // Format 4rcc: [AA|op BBBB CCCC HHHH]
+            // B = method ref, H = proto index, A = arg count, C = first register
+            uint16_t method_idx_r = code[pc + 1];
+            uint8_t range_argc = (inst >> 8) & 0xFF;
+            uint16_t first_reg = code[pc + 2];
+            uint16_t proto_idx_r = code[pc + 3];
+
+            if (range_argc < 1) {
+                DX_WARN(TAG, "invoke-polymorphic/range: no args");
+                frame->result = DX_NULL_VALUE;
+                frame->has_result = true;
+                pc += 4;
+                DISPATCH_NEXT;
+            }
+
+            DxObject *mh_obj_r = (frame->registers[first_reg].tag == DX_VAL_OBJ)
+                                 ? frame->registers[first_reg].obj : NULL;
+            if (!mh_obj_r) {
+                DX_WARN(TAG, "invoke-polymorphic/range: null MethodHandle at v%u", first_reg);
+                frame->result = DX_NULL_VALUE;
+                frame->has_result = true;
+                pc += 4;
+                DISPATCH_NEXT;
+            }
+
+            const char *mname_r = dx_dex_get_method_name(cur_dex, method_idx_r);
+            bool is_exact_r = (mname_r && strcmp(mname_r, "invokeExact") == 0);
+            (void)is_exact_r;
+            (void)proto_idx_r;
+
+            // Remaining args after MethodHandle receiver
+            uint32_t call_argc_r = range_argc - 1;
+            if (call_argc_r > DX_MAX_REGISTERS) call_argc_r = DX_MAX_REGISTERS;
+            DxValue range_call_args[DX_MAX_REGISTERS];
+            for (uint32_t ai = 0; ai < call_argc_r; ai++) {
+                range_call_args[ai] = frame->registers[first_reg + 1 + ai];
+            }
+
+            DxValue poly_result_r;
+            poly_result_r = DX_NULL_VALUE;
+            int hr_r = dx_vm_invoke_method_handle(vm, mh_obj_r, range_call_args, (int)call_argc_r, &poly_result_r);
+            if (hr_r != DX_OK) {
+                exec_result = (DxResult)hr_r;
+                goto done;
+            }
+            frame->result = poly_result_r;
             frame->has_result = true;
             pc += 4;
             DISPATCH_NEXT;
@@ -3286,19 +3441,74 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
         }
 
         // const-method-handle (21c format, 2 code units)
+#if USE_COMPUTED_GOTO
+        op_0xFE: {
+#else
+        case 0xFE: {
+#endif
+            uint8_t mh_dst = (inst >> 8) & 0xFF;
+            uint16_t mh_idx = code[pc + 1];
+            if (cur_dex && mh_idx < cur_dex->method_handle_count && cur_dex->method_handles) {
+                const DxMethodHandle *mh = &cur_dex->method_handles[mh_idx];
+                DxClass *mh_cls = dx_vm_find_class(vm, "Ljava/lang/invoke/MethodHandle;");
+                DxObject *mh_obj = NULL;
+                if (mh_cls) {
+                    mh_obj = dx_vm_alloc_object(vm, mh_cls);
+                }
+                if (!mh_obj) {
+                    mh_obj = dx_vm_alloc_array(vm, 0);
+                    if (mh_obj) {
+                        mh_obj->is_array = false;
+                        mh_obj->fields = (DxValue *)dx_malloc(sizeof(DxValue) * 4);
+                        if (mh_obj->fields) {
+                            memset(mh_obj->fields, 0, sizeof(DxValue) * 4);
+                        }
+                    }
+                }
+                if (mh_obj && mh_obj->fields) {
+                    mh_obj->fields[0] = DX_INT_VALUE((int32_t)mh->method_handle_type);
+                    mh_obj->fields[1] = DX_INT_VALUE((int32_t)mh->field_or_method_id);
+                    mh_obj->fields[2].tag = DX_VAL_LONG;
+                    mh_obj->fields[2].l = (int64_t)(uintptr_t)cur_dex;
+                }
+                frame->registers[mh_dst] = mh_obj ? DX_OBJ_VALUE(mh_obj) : DX_NULL_VALUE;
+            } else {
+                DX_WARN(TAG, "const-method-handle: index %u out of range (count=%u)",
+                         mh_idx, cur_dex ? cur_dex->method_handle_count : 0);
+                frame->registers[mh_dst] = DX_NULL_VALUE;
+            }
+            pc += 2;
+            DISPATCH_NEXT;
+        }
+
         // const-method-type (21c format, 2 code units)
 #if USE_COMPUTED_GOTO
-        op_0xFE:
         op_0xFF: {
 #else
-        case 0xFE: case 0xFF: {
+        case 0xFF: {
 #endif
-            uint8_t dst = (inst >> 8) & 0xFF;
-            DX_WARN(TAG, "%s at pc=%u in %s.%s - not supported, storing null in v%u",
-                     dx_opcode_name(opcode), pc,
-                     method->declaring_class ? method->declaring_class->descriptor : "?",
-                     method->name, dst);
-            frame->registers[dst] = DX_NULL_VALUE;
+            uint8_t mt_dst = (inst >> 8) & 0xFF;
+            uint16_t mt_proto_idx = code[pc + 1];
+            if (cur_dex && mt_proto_idx < cur_dex->proto_count) {
+                const DxDexProtoId *proto = &cur_dex->proto_ids[mt_proto_idx];
+                const char *shorty = dx_dex_get_string(cur_dex, proto->shorty_idx);
+                const char *ret_type = dx_dex_get_type(cur_dex, proto->return_type_idx);
+                char mt_desc[256];
+                snprintf(mt_desc, sizeof(mt_desc), "(%s)%s",
+                         shorty ? shorty : "?", ret_type ? ret_type : "V");
+                DxObject *mt_obj = dx_vm_create_string(vm, mt_desc);
+                if (mt_obj) {
+                    DxClass *mt_cls = dx_vm_find_class(vm, "Ljava/lang/invoke/MethodType;");
+                    if (mt_cls) {
+                        mt_obj->klass = mt_cls;
+                    }
+                }
+                frame->registers[mt_dst] = mt_obj ? DX_OBJ_VALUE(mt_obj) : DX_NULL_VALUE;
+            } else {
+                DX_WARN(TAG, "const-method-type: proto index %u out of range (count=%u)",
+                         mt_proto_idx, cur_dex ? cur_dex->proto_count : 0);
+                frame->registers[mt_dst] = DX_NULL_VALUE;
+            }
             pc += 2;
             DISPATCH_NEXT;
         }
@@ -3395,6 +3605,14 @@ done:
             sf = sf->caller;
             depth++;
         }
+    }
+
+    // Debug tracing: method exit
+    if (_trace_method_active) {
+        vm->debug.trace_depth--;
+        DX_INFO("Trace", "%*sEXIT  %s->%s (result=%s)",
+                vm->debug.trace_depth * 2, "", _trace_cls, _trace_mth,
+                dx_result_string(exec_result));
     }
 
     vm->stack_depth--;

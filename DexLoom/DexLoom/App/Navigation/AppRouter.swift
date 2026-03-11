@@ -13,6 +13,10 @@ struct AppRouter: View {
                 RuntimeView(bridge: appState.bridge)
             }
 
+            Tab(AppTab.inspector.rawValue, systemImage: AppTab.inspector.icon, value: .inspector) {
+                InspectorTabView(bridge: appState.bridge)
+            }
+
             Tab(AppTab.logs.rawValue, systemImage: AppTab.logs.icon, value: .logs) {
                 LogsView(bridge: appState.bridge)
             }

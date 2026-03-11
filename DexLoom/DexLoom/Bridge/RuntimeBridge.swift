@@ -1,5 +1,6 @@
 import Foundation
 import Combine
+import UIKit
 
 struct LogEntry: Identifiable {
     let id = UUID()
@@ -7,6 +8,111 @@ struct LogEntry: Identifiable {
     let level: String
     let tag: String
     let message: String
+}
+
+// MARK: - DEX Browser Models
+
+struct DEXClassInfo: Identifiable, Hashable {
+    let id = UUID()
+    let classDefIndex: UInt32
+    let name: String
+    let accessFlags: UInt32
+    let methodCount: Int
+    let fieldCount: Int
+
+    var displayName: String {
+        // Convert "Lcom/example/Foo;" to "com.example.Foo"
+        var n = name
+        if n.hasPrefix("L") && n.hasSuffix(";") {
+            n = String(n.dropFirst().dropLast())
+        }
+        return n.replacingOccurrences(of: "/", with: ".")
+    }
+
+    var accessFlagsText: String {
+        accessFlagsString(accessFlags, isClass: true)
+    }
+}
+
+struct DEXMethodInfo: Identifiable {
+    let id = UUID()
+    let name: String
+    let descriptor: String
+    let accessFlags: UInt32
+    let registerCount: Int
+    let codeSize: Int
+
+    var accessFlagsText: String {
+        accessFlagsString(accessFlags, isClass: false)
+    }
+}
+
+struct DEXFieldInfo: Identifiable {
+    let id = UUID()
+    let name: String
+    let type: String
+    let accessFlags: UInt32
+
+    var accessFlagsText: String {
+        accessFlagsString(accessFlags, isClass: false)
+    }
+}
+
+struct DEXClassDetail {
+    let methods: [DEXMethodInfo]
+    let fields: [DEXFieldInfo]
+}
+
+// MARK: - Manifest Models
+
+struct ManifestInfo {
+    let packageName: String
+    let mainActivity: String
+    let minSdk: Int32
+    let targetSdk: Int32
+    let appLabel: String
+    let appTheme: String
+    let activities: [ManifestComponentInfo]
+    let services: [ManifestComponentInfo]
+    let receivers: [ManifestComponentInfo]
+    let providers: [ManifestComponentInfo]
+    let permissions: [String]
+    let features: [ManifestFeatureInfo]
+}
+
+struct ManifestComponentInfo: Identifiable {
+    let id = UUID()
+    let name: String
+    let exported: Bool
+    let intentFilters: [ManifestIntentFilterInfo]
+}
+
+struct ManifestIntentFilterInfo: Identifiable {
+    let id = UUID()
+    let actions: [String]
+    let categories: [String]
+}
+
+struct ManifestFeatureInfo {
+    let name: String
+    let required: Bool
+}
+
+// MARK: - Access Flags Helper
+
+private func accessFlagsString(_ flags: UInt32, isClass: Bool) -> String {
+    var parts: [String] = []
+    if flags & 0x0001 != 0 { parts.append("public") }
+    if flags & 0x0002 != 0 { parts.append("private") }
+    if flags & 0x0004 != 0 { parts.append("protected") }
+    if flags & 0x0008 != 0 { parts.append("static") }
+    if flags & 0x0010 != 0 { parts.append("final") }
+    if flags & 0x0020 != 0 && !isClass { parts.append("synchronized") }
+    if flags & 0x0100 != 0 { parts.append("native") }
+    if flags & 0x0200 != 0 { parts.append("interface") }
+    if flags & 0x0400 != 0 { parts.append("abstract") }
+    if flags & 0x4000 != 0 { parts.append("enum") }
+    return parts.joined(separator: " ")
 }
 
 /// ConstraintLayout constraint anchors for a child view
@@ -21,6 +127,8 @@ struct ConstraintAnchors {
     let bottomToTop: UInt32
     let horizontalBias: Float   // 0.0-1.0, default 0.5
     let verticalBias: Float
+    let hChainStyle: UInt8      // 0=none, 1=spread, 2=spread_inside, 3=packed
+    let vChainStyle: UInt8      // 0=none, 1=spread, 2=spread_inside, 3=packed
 
     var hasHorizontal: Bool {
         let hasLeft = leftToLeft != 0 || leftToRight != 0
@@ -124,6 +232,10 @@ struct RenderNode: Identifiable {
     let relLeftOf: UInt32         // layout_toLeftOf view ID
     let relRightOf: UInt32        // layout_toRightOf view ID
     let constraints: ConstraintAnchors  // ConstraintLayout constraints
+    let isGuideline: Bool              // true if this is a ConstraintLayout guideline
+    let guidelineOrientation: UInt8    // 0=horizontal, 1=vertical
+    let guidelinePercent: Float        // 0.0-1.0, or -1 if using begin
+    let guidelineBegin: Float          // dp offset from start, or -1
     let imageData: Data?          // PNG/JPEG bytes for ImageView
     let isNinePatch: Bool         // true if image is a compiled 9-patch PNG
     let ninePatchPadding: (Int32, Int32, Int32, Int32)   // left, top, right, bottom content padding
@@ -161,10 +273,22 @@ final class RuntimeBridge: ObservableObject {
     private var pendingLogs: [(String, String, String)] = []
     private var logFlushScheduled = false
     private static let maxLogs = 1000
+    private var memoryWarningObserver: NSObjectProtocol?
 
     init() {
         addLog(level: "INFO", tag: "Bridge", message: "DexLoom runtime bridge initialized")
         RuntimeBridge.setupNetworkBridge()
+
+        // Register for iOS memory pressure warnings
+        memoryWarningObserver = NotificationCenter.default.addObserver(
+            forName: UIApplication.didReceiveMemoryWarningNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            guard let self = self, let ctx = self.context, let vm = ctx.pointee.vm else { return }
+            self.addLog(level: "WARN", tag: "Bridge", message: "Memory warning received — forcing GC")
+            dx_vm_gc_collect(vm)
+        }
     }
 
     /// Install the C-to-Swift network callback for real HTTP requests via URLSession
@@ -262,6 +386,9 @@ final class RuntimeBridge: ObservableObject {
     }
 
     deinit {
+        if let observer = memoryWarningObserver {
+            NotificationCenter.default.removeObserver(observer)
+        }
         if let ctx = context {
             dx_runtime_shutdown(ctx)
         }
@@ -494,6 +621,294 @@ final class RuntimeBridge: ObservableObject {
         renderTree = nil
     }
 
+    // MARK: - Inspector Data
+
+    /// Get all DEX classes with summary info
+    func getDEXClasses() -> [DEXClassInfo] {
+        guard let ctx = context, let dex = ctx.pointee.dex else { return [] }
+        var result: [DEXClassInfo] = []
+        let count = Int(dex.pointee.class_count)
+
+        for i in 0..<count {
+            let classDef = dex.pointee.class_defs.advanced(by: i).pointee
+            let className = dx_dex_get_type(dex, classDef.class_idx).map { String(cString: $0) } ?? "?"
+
+            // Parse class data to get method/field counts
+            var methodCount = 0
+            var fieldCount = 0
+            if classDef.class_data_off != 0 {
+                let parseResult = dx_dex_parse_class_data(dex, UInt32(i))
+                if parseResult == DX_OK, let cd = dex.pointee.class_data.advanced(by: i).pointee {
+                    methodCount = Int(cd.pointee.direct_methods_count + cd.pointee.virtual_methods_count)
+                    fieldCount = Int(cd.pointee.static_fields_count + cd.pointee.instance_fields_count)
+                }
+            }
+
+            result.append(DEXClassInfo(
+                classDefIndex: UInt32(i),
+                name: className,
+                accessFlags: classDef.access_flags,
+                methodCount: methodCount,
+                fieldCount: fieldCount
+            ))
+        }
+
+        return result
+    }
+
+    /// Get detailed class info (methods and fields) by class def index
+    func getDEXClassDetail(index: UInt32) -> DEXClassDetail? {
+        guard let ctx = context, let dex = ctx.pointee.dex else { return nil }
+        guard index < dex.pointee.class_count else { return nil }
+
+        let classDef = dex.pointee.class_defs.advanced(by: Int(index)).pointee
+        guard classDef.class_data_off != 0 else {
+            return DEXClassDetail(methods: [], fields: [])
+        }
+
+        let parseResult = dx_dex_parse_class_data(dex, index)
+        guard parseResult == DX_OK, let cd = dex.pointee.class_data.advanced(by: Int(index)).pointee else {
+            return DEXClassDetail(methods: [], fields: [])
+        }
+
+        var methods: [DEXMethodInfo] = []
+
+        // Direct methods
+        for j in 0..<Int(cd.pointee.direct_methods_count) {
+            let em = cd.pointee.direct_methods.advanced(by: j).pointee
+            let info = buildMethodInfo(dex: dex, encodedMethod: em)
+            methods.append(info)
+        }
+
+        // Virtual methods
+        for j in 0..<Int(cd.pointee.virtual_methods_count) {
+            let em = cd.pointee.virtual_methods.advanced(by: j).pointee
+            let info = buildMethodInfo(dex: dex, encodedMethod: em)
+            methods.append(info)
+        }
+
+        var fields: [DEXFieldInfo] = []
+
+        // Static fields
+        for j in 0..<Int(cd.pointee.static_fields_count) {
+            let ef = cd.pointee.static_fields.advanced(by: j).pointee
+            let info = buildFieldInfo(dex: dex, encodedField: ef)
+            fields.append(info)
+        }
+
+        // Instance fields
+        for j in 0..<Int(cd.pointee.instance_fields_count) {
+            let ef = cd.pointee.instance_fields.advanced(by: j).pointee
+            let info = buildFieldInfo(dex: dex, encodedField: ef)
+            fields.append(info)
+        }
+
+        return DEXClassDetail(methods: methods, fields: fields)
+    }
+
+    private func buildMethodInfo(dex: UnsafeMutablePointer<DxDexFile>, encodedMethod: DxDexEncodedMethod) -> DEXMethodInfo {
+        let name = dx_dex_get_method_name(dex, encodedMethod.method_idx).map { String(cString: $0) } ?? "?"
+        let returnType = dx_dex_get_method_return_type(dex, encodedMethod.method_idx).map { String(cString: $0) } ?? "V"
+
+        // Build descriptor from params + return type
+        var paramTypes: [String] = []
+        let paramCount = dx_dex_get_method_param_count(dex, encodedMethod.method_idx)
+        for p in 0..<paramCount {
+            if let pt = dx_dex_get_method_param_type(dex, encodedMethod.method_idx, p) {
+                paramTypes.append(String(cString: pt))
+            }
+        }
+        let descriptor = "(\(paramTypes.joined(separator: ", "))) -> \(returnType)"
+
+        var regCount = 0
+        var codeSize = 0
+        if encodedMethod.code_off != 0 {
+            var codeItem = DxDexCodeItem()
+            if dx_dex_parse_code_item(dex, encodedMethod.code_off, &codeItem) == DX_OK {
+                regCount = Int(codeItem.registers_size)
+                codeSize = Int(codeItem.insns_size)
+                dx_dex_free_code_item(&codeItem)
+            }
+        }
+
+        return DEXMethodInfo(
+            name: name,
+            descriptor: descriptor,
+            accessFlags: encodedMethod.access_flags,
+            registerCount: regCount,
+            codeSize: codeSize
+        )
+    }
+
+    private func buildFieldInfo(dex: UnsafeMutablePointer<DxDexFile>, encodedField: DxDexEncodedField) -> DEXFieldInfo {
+        let name = dx_dex_get_field_name(dex, encodedField.field_idx).map { String(cString: $0) } ?? "?"
+        let fieldId = dex.pointee.field_ids.advanced(by: Int(encodedField.field_idx)).pointee
+        let fieldType = dx_dex_get_type(dex, UInt32(fieldId.type_idx)).map { String(cString: $0) } ?? "?"
+
+        return DEXFieldInfo(
+            name: name,
+            type: fieldType,
+            accessFlags: encodedField.access_flags
+        )
+    }
+
+    /// Parse manifest from the loaded APK
+    func getManifestInfo() -> ManifestInfo? {
+        guard let ctx = context, let apkOpaque = ctx.pointee.apk else { return nil }
+        // Cast from OpaquePointer (struct DxApkFile *) to typed pointer (typedef DxApkFile *)
+        let apk = UnsafePointer<DxApkFile>(apkOpaque)
+
+        // Find and extract AndroidManifest.xml
+        var entryPtr: UnsafePointer<DxZipEntry>?
+        guard dx_apk_find_entry(apk, "AndroidManifest.xml", &entryPtr) == DX_OK,
+              let entry = entryPtr else { return nil }
+
+        var dataPtr: UnsafeMutablePointer<UInt8>?
+        var dataSize: UInt32 = 0
+        guard dx_apk_extract_entry(apk, entry, &dataPtr, &dataSize) == DX_OK,
+              let data = dataPtr else { return nil }
+        defer { dx_free(data) }
+
+        var manifestPtr: UnsafeMutablePointer<DxManifest>?
+        guard dx_manifest_parse(data, dataSize, &manifestPtr) == DX_OK,
+              let manifest = manifestPtr else { return nil }
+        defer { dx_manifest_free(manifest) }
+
+        let m = manifest.pointee
+
+        // Build activities
+        var activities: [ManifestComponentInfo] = []
+        for i in 0..<Int(m.activity_component_count) {
+            let comp = m.activity_components.advanced(by: i).pointee
+            activities.append(buildComponentInfo(comp))
+        }
+        // If no rich components, fall back to name list
+        if activities.isEmpty {
+            for i in 0..<Int(m.activity_count) {
+                if let namePtr = m.activities.advanced(by: i).pointee {
+                    activities.append(ManifestComponentInfo(
+                        name: String(cString: namePtr),
+                        exported: false,
+                        intentFilters: []
+                    ))
+                }
+            }
+        }
+
+        // Build services
+        var services: [ManifestComponentInfo] = []
+        for i in 0..<Int(m.service_component_count) {
+            let comp = m.service_components.advanced(by: i).pointee
+            services.append(buildComponentInfo(comp))
+        }
+        if services.isEmpty {
+            for i in 0..<Int(m.service_count) {
+                if let namePtr = m.services.advanced(by: i).pointee {
+                    services.append(ManifestComponentInfo(
+                        name: String(cString: namePtr),
+                        exported: false,
+                        intentFilters: []
+                    ))
+                }
+            }
+        }
+
+        // Build receivers
+        var receivers: [ManifestComponentInfo] = []
+        for i in 0..<Int(m.receiver_component_count) {
+            let comp = m.receiver_components.advanced(by: i).pointee
+            receivers.append(buildComponentInfo(comp))
+        }
+        if receivers.isEmpty {
+            for i in 0..<Int(m.receiver_count) {
+                if let namePtr = m.receivers.advanced(by: i).pointee {
+                    receivers.append(ManifestComponentInfo(
+                        name: String(cString: namePtr),
+                        exported: false,
+                        intentFilters: []
+                    ))
+                }
+            }
+        }
+
+        // Build providers
+        var providers: [ManifestComponentInfo] = []
+        for i in 0..<Int(m.provider_component_count) {
+            let comp = m.provider_components.advanced(by: i).pointee
+            providers.append(buildComponentInfo(comp))
+        }
+        if providers.isEmpty {
+            for i in 0..<Int(m.provider_count) {
+                if let namePtr = m.providers.advanced(by: i).pointee {
+                    providers.append(ManifestComponentInfo(
+                        name: String(cString: namePtr),
+                        exported: false,
+                        intentFilters: []
+                    ))
+                }
+            }
+        }
+
+        // Permissions
+        var permissions: [String] = []
+        for i in 0..<Int(m.permission_count) {
+            if let namePtr = m.permissions.advanced(by: i).pointee {
+                permissions.append(String(cString: namePtr))
+            }
+        }
+
+        // Features
+        var features: [ManifestFeatureInfo] = []
+        for i in 0..<Int(m.feature_count) {
+            let f = m.features.advanced(by: i).pointee
+            let name = f.name.map { String(cString: $0) } ?? "?"
+            features.append(ManifestFeatureInfo(name: name, required: f.required))
+        }
+
+        return ManifestInfo(
+            packageName: m.package_name.map { String(cString: $0) } ?? "unknown",
+            mainActivity: m.main_activity.map { String(cString: $0) } ?? "",
+            minSdk: m.min_sdk,
+            targetSdk: m.target_sdk,
+            appLabel: m.app_label.map { String(cString: $0) } ?? "",
+            appTheme: m.app_theme.map { String(cString: $0) } ?? "",
+            activities: activities,
+            services: services,
+            receivers: receivers,
+            providers: providers,
+            permissions: permissions,
+            features: features
+        )
+    }
+
+    private func buildComponentInfo(_ comp: DxComponent) -> ManifestComponentInfo {
+        let name = comp.name.map { String(cString: $0) } ?? "?"
+
+        var filters: [ManifestIntentFilterInfo] = []
+        for i in 0..<Int(comp.intent_filter_count) {
+            let f = comp.intent_filters.advanced(by: i).pointee
+            var actions: [String] = []
+            for j in 0..<Int(f.action_count) {
+                if let ptr = f.actions.advanced(by: j).pointee {
+                    actions.append(String(cString: ptr))
+                }
+            }
+            var categories: [String] = []
+            for j in 0..<Int(f.category_count) {
+                if let ptr = f.categories.advanced(by: j).pointee {
+                    categories.append(String(cString: ptr))
+                }
+            }
+            filters.append(ManifestIntentFilterInfo(actions: actions, categories: categories))
+        }
+
+        return ManifestComponentInfo(
+            name: name,
+            exported: comp.exported,
+            intentFilters: filters
+        )
+    }
+
     // MARK: - Diagnostics
 
     /// Dump the UI tree hierarchy as a formatted string
@@ -513,6 +928,13 @@ final class RuntimeBridge: ObservableObject {
         let result = String(cString: cStr)
         dx_free(cStr)
         return result
+    }
+
+    /// Get the missing features report from the VM
+    func missingFeaturesReport() -> String {
+        guard let ctx = context, let vm = ctx.pointee.vm else { return "(no VM)" }
+        guard let cStr = dx_vm_get_missing_features(vm) else { return "(none)" }
+        return String(cString: cStr)
     }
 
     /// Get last error detail with register snapshot and stack trace
@@ -597,7 +1019,9 @@ final class RuntimeBridge: ObservableObject {
             bottomToBottom: ca.bottom_to_bottom,
             bottomToTop: ca.bottom_to_top,
             horizontalBias: ca.horizontal_bias,
-            verticalBias: ca.vertical_bias
+            verticalBias: ca.vertical_bias,
+            hChainStyle: ca.h_chain_style,
+            vChainStyle: ca.v_chain_style
         )
 
         // Convert draw commands
@@ -658,6 +1082,10 @@ final class RuntimeBridge: ObservableObject {
             relLeftOf: n.rel_left_of,
             relRightOf: n.rel_right_of,
             constraints: anchors,
+            isGuideline: n.is_guideline,
+            guidelineOrientation: n.guideline_orientation,
+            guidelinePercent: n.guideline_percent,
+            guidelineBegin: n.guideline_begin,
             imageData: imgData,
             isNinePatch: n.is_nine_patch,
             ninePatchPadding: (n.nine_patch_padding.0, n.nine_patch_padding.1,

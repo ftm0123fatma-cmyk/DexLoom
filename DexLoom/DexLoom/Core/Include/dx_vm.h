@@ -225,6 +225,15 @@ struct DxVM {
     // Missing feature tracker
     DxMissingFeatures missing_features;
 
+    // Debug tracing
+    struct {
+        bool bytecode_trace;      // Log each instruction
+        bool class_load_trace;    // Log class loads
+        bool method_call_trace;   // Log method entry/exit
+        const char *trace_method_filter; // NULL = all, else prefix match
+        int trace_depth;          // Current call depth (for indentation)
+    } debug;
+
     // Diagnostic info captured on error
     struct {
         bool     has_error;
@@ -295,6 +304,9 @@ DxResult dx_vm_run_main_activity(DxVM *vm, const char *activity_class);
 DxResult dx_vm_invoke_custom(DxVM *vm, DxFrame *frame, uint32_t call_site_idx,
                               DxValue *args, uint32_t arg_count);
 
+// invoke-polymorphic (MethodHandle.invoke / invokeExact dispatch)
+int dx_vm_invoke_method_handle(DxVM *vm, DxObject *handle_obj, DxValue *args, int argc, DxValue *result);
+
 // Annotation lookup on class/method
 const DxAnnotationEntry *dx_class_get_annotation(DxClass *cls, const char *type_desc);
 const DxAnnotationEntry *dx_method_get_annotation(DxMethod *method, const char *type_desc);
@@ -316,5 +328,9 @@ void        dx_crash_install_handlers(DxVM *vm);
 void        dx_crash_uninstall_handlers(void);
 int         dx_crash_get_signal(void);
 sigjmp_buf *dx_crash_get_jmpbuf(void);
+
+// Debug tracing configuration
+void dx_vm_set_trace(DxVM *vm, bool bytecode, bool class_load, bool method_call);
+void dx_vm_set_trace_filter(DxVM *vm, const char *method_filter);
 
 #endif // DX_VM_H

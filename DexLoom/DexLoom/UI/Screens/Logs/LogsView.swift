@@ -4,25 +4,45 @@ import UniformTypeIdentifiers
 struct LogsView: View {
     @ObservedObject var bridge: RuntimeBridge
     @State private var filterLevel: String = "ALL"
+    @State private var searchText = ""
+    @State private var selectedTag: String? = nil
     @State private var autoScroll = true
     @State private var showCopiedToast = false
     @State private var showDiagnostics = false
     @State private var diagnosticText: String = ""
     @State private var diagnosticTitle: String = ""
+    @State private var showShareSheet = false
+    @State private var shareContent: String = ""
 
     private let levels = ["ALL", "TRACE", "DEBUG", "INFO", "WARN", "ERROR"]
 
+    /// All unique tags present in current logs
+    private var availableTags: [String] {
+        let tags = Set(bridge.logs.map { $0.tag })
+        return tags.sorted()
+    }
+
     var filteredLogs: [LogEntry] {
-        if filterLevel == "ALL" {
-            return bridge.logs
+        bridge.logs.filter { entry in
+            let matchesLevel = filterLevel == "ALL" || entry.level == filterLevel
+            let matchesSearch = searchText.isEmpty || entry.message.localizedCaseInsensitiveContains(searchText) || entry.tag.localizedCaseInsensitiveContains(searchText)
+            let matchesTag = selectedTag == nil || entry.tag == selectedTag
+            return matchesLevel && matchesSearch && matchesTag
         }
-        return bridge.logs.filter { $0.level == filterLevel }
     }
 
     var body: some View {
         NavigationStack {
             VStack(spacing: 0) {
-                // Filter bar
+                // Search bar
+                TextField("Search logs...", text: $searchText)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.dxCaption)
+                    .padding(.horizontal)
+                    .padding(.top, 8)
+                    .padding(.bottom, 4)
+
+                // Level filter bar
                 ScrollView(.horizontal, showsIndicators: false) {
                     HStack(spacing: 8) {
                         ForEach(levels, id: \.self) { level in
@@ -60,9 +80,45 @@ struct LogsView: View {
                         .foregroundStyle(Color.dxError)
                     }
                     .padding(.horizontal)
-                    .padding(.vertical, 8)
+                    .padding(.vertical, 4)
                 }
                 .background(Color.dxSurface)
+
+                // Tag filter bar
+                if !availableTags.isEmpty {
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        HStack(spacing: 6) {
+                            Button {
+                                selectedTag = nil
+                            } label: {
+                                Text("All Tags")
+                                    .font(.system(size: 11, weight: .medium))
+                                    .padding(.horizontal, 8)
+                                    .padding(.vertical, 4)
+                                    .background(selectedTag == nil ? Color.dxSecondary : Color.dxSurface)
+                                    .foregroundStyle(selectedTag == nil ? Color.white : Color.dxTextSecondary)
+                                    .clipShape(Capsule())
+                            }
+
+                            ForEach(availableTags, id: \.self) { tag in
+                                Button {
+                                    selectedTag = (selectedTag == tag) ? nil : tag
+                                } label: {
+                                    Text(tag)
+                                        .font(.system(size: 11, weight: .medium))
+                                        .padding(.horizontal, 8)
+                                        .padding(.vertical, 4)
+                                        .background(selectedTag == tag ? Color.dxSecondary : Color.dxSurface)
+                                        .foregroundStyle(selectedTag == tag ? Color.white : Color.dxTextSecondary)
+                                        .clipShape(Capsule())
+                                }
+                            }
+                        }
+                        .padding(.horizontal)
+                        .padding(.vertical, 4)
+                    }
+                    .background(Color.dxSurface.opacity(0.7))
+                }
 
                 // Log list
                 ScrollViewReader { proxy in
@@ -76,6 +132,11 @@ struct LogsView: View {
                                             UIPasteboard.general.string = "[\(entry.level)] \(entry.tag): \(entry.message)"
                                         } label: {
                                             Label("Copy Line", systemImage: "doc.on.doc")
+                                        }
+                                        Button {
+                                            selectedTag = entry.tag
+                                        } label: {
+                                            Label("Filter by \"\(entry.tag)\"", systemImage: "line.3.horizontal.decrease.circle")
                                         }
                                     }
                             }
@@ -128,6 +189,35 @@ struct LogsView: View {
                             }
                         } label: {
                             Label("Copy Errors Only", systemImage: "exclamationmark.triangle")
+                        }
+
+                        Divider()
+
+                        // Report generation
+                        Button {
+                            shareContent = generateCrashReport()
+                            showShareSheet = true
+                        } label: {
+                            Label("Share Report", systemImage: "square.and.arrow.up")
+                        }
+
+                        Button {
+                            let json = exportLogsAsJSON()
+                            UIPasteboard.general.string = json
+                            showCopiedToast = true
+                            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+                                showCopiedToast = false
+                            }
+                        } label: {
+                            Label("Export JSON to Clipboard", systemImage: "curlybraces")
+                        }
+
+                        Button {
+                            let json = exportLogsAsJSON()
+                            shareContent = json
+                            showShareSheet = true
+                        } label: {
+                            Label("Share JSON Logs", systemImage: "square.and.arrow.up.on.square")
                         }
 
                         Divider()
@@ -190,8 +280,93 @@ struct LogsView: View {
                     }
                 )
             }
+            .sheet(isPresented: $showShareSheet) {
+                ShareSheet(items: [shareContent])
+            }
         }
     }
+
+    // MARK: - Crash Report Generation
+
+    private func generateCrashReport() -> String {
+        let dateFormatter = DateFormatter()
+        dateFormatter.dateFormat = "yyyy-MM-dd HH:mm:ss Z"
+
+        var report = "=== DexLoom Crash Report ===\n"
+        report += "Date: \(dateFormatter.string(from: Date()))\n"
+        report += "Device: \(UIDevice.current.model) iOS \(UIDevice.current.systemVersion)\n"
+        report += "App: DexLoom\n\n"
+
+        // APK info
+        report += "--- APK Info ---\n"
+        report += "Package: \(bridge.packageName ?? "(none)")\n"
+        report += "Main Activity: \(bridge.activityName ?? "(none)")\n"
+        report += "DEX Classes: \(bridge.dexClassCount)\n"
+        report += "DEX Methods: \(bridge.dexMethodCount)\n"
+        report += "DEX Strings: \(bridge.dexStringCount)\n"
+        report += "Loaded: \(bridge.isLoaded)\n"
+        report += "Running: \(bridge.isRunning)\n"
+        if let err = bridge.errorMessage {
+            report += "Error: \(err)\n"
+        }
+
+        report += "\n--- Missing Features ---\n"
+        report += bridge.missingFeaturesReport()
+        report += "\n"
+
+        report += "\n--- Last Error Detail ---\n"
+        report += bridge.lastErrorDetail()
+        report += "\n"
+
+        report += "\n--- Heap Stats ---\n"
+        report += bridge.heapStats()
+        report += "\n"
+
+        report += "\n--- Recent Logs (last 50) ---\n"
+        let recentLogs = bridge.logs.suffix(50)
+        let logFormatter = DateFormatter()
+        logFormatter.dateFormat = "HH:mm:ss.SSS"
+        for entry in recentLogs {
+            let ts = logFormatter.string(from: entry.timestamp)
+            report += "[\(ts)] [\(entry.level)] \(entry.tag): \(entry.message)\n"
+        }
+
+        report += "\n=== End Report ===\n"
+        return report
+    }
+
+    // MARK: - JSON Export
+
+    private func exportLogsAsJSON() -> String {
+        let dateFormatter = ISO8601DateFormatter()
+        dateFormatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+
+        let entries: [[String: String]] = bridge.logs.map { log in
+            [
+                "timestamp": dateFormatter.string(from: log.timestamp),
+                "level": log.level,
+                "tag": log.tag,
+                "message": log.message
+            ]
+        }
+        guard let data = try? JSONSerialization.data(withJSONObject: entries, options: .prettyPrinted),
+              let jsonString = String(data: data, encoding: .utf8) else {
+            return "[]"
+        }
+        return jsonString
+    }
+}
+
+// MARK: - Share Sheet
+
+struct ShareSheet: UIViewControllerRepresentable {
+    let items: [Any]
+
+    func makeUIViewController(context: Context) -> UIActivityViewController {
+        UIActivityViewController(activityItems: items, applicationActivities: nil)
+    }
+
+    func updateUIViewController(_ uiViewController: UIActivityViewController, context: Context) {}
 }
 
 // MARK: - Diagnostic Sheet

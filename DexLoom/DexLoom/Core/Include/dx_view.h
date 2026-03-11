@@ -64,6 +64,16 @@ typedef struct {
 
 #define DX_MAX_DRAW_COMMANDS 256
 
+// Chain style constants
+#define DX_CHAIN_NONE          0
+#define DX_CHAIN_SPREAD        1
+#define DX_CHAIN_SPREAD_INSIDE 2
+#define DX_CHAIN_PACKED        3
+
+// Guideline orientation constants
+#define DX_GUIDELINE_HORIZONTAL 0
+#define DX_GUIDELINE_VERTICAL   1
+
 // ConstraintLayout constraint anchors stored per child node
 typedef struct DxConstraints {
     uint32_t left_to_left;     // view ID or DX_CONSTRAINT_PARENT
@@ -76,6 +86,8 @@ typedef struct DxConstraints {
     uint32_t bottom_to_top;    // view ID or DX_CONSTRAINT_PARENT
     float    horizontal_bias;  // 0.0-1.0, default 0.5
     float    vertical_bias;    // 0.0-1.0, default 0.5
+    uint8_t  h_chain_style;    // 0=none, 1=spread, 2=spread_inside, 3=packed
+    uint8_t  v_chain_style;    // 0=none, 1=spread, 2=spread_inside, 3=packed
 } DxConstraints;
 
 // UI tree node - represents an Android View in the internal UI tree
@@ -113,6 +125,12 @@ struct DxUINode {
 
     // ConstraintLayout constraints
     DxConstraints constraints;
+
+    // ConstraintLayout guideline properties
+    bool          is_guideline;
+    uint8_t       guideline_orientation; // 0=horizontal, 1=vertical
+    float         guideline_percent;     // 0.0-1.0, or -1 if using begin
+    float         guideline_begin;       // dp offset from start, or -1
 
     // Image data (for ImageView - extracted from APK drawable resources)
     uint8_t     *image_data;       // PNG/JPEG bytes (owned, freed on destroy)
@@ -197,6 +215,12 @@ typedef struct DxRenderNode {
 
     // ConstraintLayout constraints
     DxConstraints constraints;
+
+    // ConstraintLayout guideline properties
+    bool           is_guideline;
+    uint8_t        guideline_orientation; // 0=horizontal, 1=vertical
+    float          guideline_percent;     // 0.0-1.0, or -1 if using begin
+    float          guideline_begin;       // dp offset from start, or -1
 
     // Image data (for ImageView)
     const uint8_t *image_data;     // PNG/JPEG bytes (NOT owned - points into DxUINode data)

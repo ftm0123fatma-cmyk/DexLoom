@@ -2,6 +2,7 @@
 #define DX_CONTEXT_H
 
 #include "dx_types.h"
+#include "dx_apk.h"
 #include "dx_resources.h"
 
 // DxContext is the top-level runtime context.
@@ -14,7 +15,7 @@ struct DxContext {
     DxRenderModel *render_model;
 
     // APK data (persisted for runtime drawable extraction)
-    struct DxApkFile *apk;         // parsed APK ZIP handle
+    DxApkFile *apk;                // parsed APK ZIP handle
     uint8_t     *apk_raw_data;     // raw APK file bytes (owned, apk references this)
     char        *apk_path;
     char        *package_name;

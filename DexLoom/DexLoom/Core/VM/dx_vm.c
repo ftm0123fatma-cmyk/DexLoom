@@ -152,6 +152,16 @@ static DxClass *create_class(DxVM *vm, const char *descriptor, DxClass *super, b
 
     vm->classes[vm->class_count++] = cls;
     dx_vm_class_hash_insert(vm, cls);
+
+    // Debug tracing: log class loads
+    if (vm->debug.class_load_trace) {
+        uint32_t dex_idx = 0;
+        for (uint32_t d = 0; d < vm->dex_count; d++) {
+            if (vm->dex_files[d] == vm->dex) { dex_idx = d; break; }
+        }
+        DX_INFO("Trace", "LOAD CLASS: %s from DEX %u", descriptor, dex_idx);
+    }
+
     return cls;
 }
 
@@ -1209,6 +1219,20 @@ static DxResult native_system_arraycopy(DxVM *vm, DxFrame *frame, DxValue *args,
     memmove(&dst->array_elements[dst_pos], &src->array_elements[src_pos],
             sizeof(DxValue) * length);
     DX_TRACE(TAG, "System.arraycopy: copied %d elements", length);
+    return DX_OK;
+}
+
+static DxResult native_system_loadlibrary(DxVM *vm, DxFrame *frame, DxValue *args, uint32_t arg_count) {
+    (void)frame;
+    const char *lib_name = "(unknown)";
+    if (arg_count > 0 && args[0].tag == DX_VAL_OBJ && args[0].obj) {
+        const char *s = dx_vm_get_string_value(args[0].obj);
+        if (s) lib_name = s;
+    }
+    char feat_buf[160];
+    snprintf(feat_buf, sizeof(feat_buf), "System.loadLibrary(\"%s\") — native .so loading unsupported", lib_name);
+    dx_vm_report_missing_feature(vm, feat_buf);
+    DX_WARN(TAG, "System.loadLibrary(\"%s\") called — .so loading not supported, absorbed", lib_name);
     return DX_OK;
 }
 
@@ -3333,6 +3357,8 @@ DxResult dx_register_java_lang(DxVM *vm) {
                       native_system_arraycopy, true);
     add_native_method(sys_cls, "getProperties", "L", DX_ACC_PUBLIC | DX_ACC_STATIC,
                       native_object_init, true);  // returns a stub object
+    add_native_method(sys_cls, "loadLibrary", "VL", DX_ACC_PUBLIC | DX_ACC_STATIC,
+                      native_system_loadlibrary, true);
     sys_cls->status = DX_CLASS_INITIALIZED;
 
     // java.lang.Math
@@ -3904,6 +3930,10 @@ DxResult dx_vm_load_class(DxVM *vm, const char *descriptor, DxClass **out) {
         for (uint32_t d = 0; d < vm->dex_count; d++) total += vm->dex_files[d]->class_count;
         DX_ERROR(TAG, "Class not found: %s (%u classes across %u DEX files)",
                 descriptor, total, vm->dex_count);
+        // Track as missing feature for diagnostics
+        char feat_buf[160];
+        snprintf(feat_buf, sizeof(feat_buf), "Class not found: %s", descriptor);
+        dx_vm_report_missing_feature(vm, feat_buf);
         if (out) *out = NULL;
         loading_depth--;
         return DX_ERR_CLASS_NOT_FOUND;
@@ -5161,6 +5191,168 @@ DxResult dx_vm_invoke_custom(DxVM *vm, DxFrame *frame, uint32_t call_site_idx,
     return DX_OK;
 }
 
+// ─── invoke-polymorphic: MethodHandle dispatch ───
+
+int dx_vm_invoke_method_handle(DxVM *vm, DxObject *handle_obj, DxValue *args, int argc, DxValue *result) {
+    if (!vm || !handle_obj) {
+        if (result) *result = DX_NULL_VALUE;
+        return DX_OK;
+    }
+
+    // The handle object stores: fields[0] = kind (int), fields[1] = target index (int),
+    // fields[2] = dex file pointer (stored as long/intptr)
+    if (!handle_obj->fields) {
+        DX_WARN(TAG, "invoke-method-handle: handle has no fields");
+        if (result) *result = DX_NULL_VALUE;
+        return DX_OK;
+    }
+
+    int32_t kind = handle_obj->fields[0].i;
+    int32_t target_idx = handle_obj->fields[1].i;
+
+    // Get the DEX file - stored in field[2] or fall back to VM's current
+    DxDexFile *dex = NULL;
+    if (handle_obj->fields[2].tag == DX_VAL_LONG) {
+        dex = (DxDexFile *)(uintptr_t)handle_obj->fields[2].l;
+    }
+    if (!dex) {
+        if (vm->current_frame && vm->current_frame->method &&
+            vm->current_frame->method->declaring_class &&
+            vm->current_frame->method->declaring_class->dex_file) {
+            dex = vm->current_frame->method->declaring_class->dex_file;
+        }
+        if (!dex) dex = vm->dex;
+    }
+
+    switch (kind) {
+        case DX_METHOD_HANDLE_INVOKE_STATIC: {
+            // Static method: all args are method params (no receiver)
+            DxMethod *target = dx_vm_resolve_method(vm, (uint32_t)target_idx);
+            if (!target) {
+                DX_WARN(TAG, "invoke-method-handle: cannot resolve static method %d", target_idx);
+                if (result) *result = DX_NULL_VALUE;
+                return DX_OK;
+            }
+            return dx_vm_execute_method(vm, target, args, (uint32_t)argc, result);
+        }
+
+        case DX_METHOD_HANDLE_INVOKE_INSTANCE:
+        case DX_METHOD_HANDLE_INVOKE_DIRECT:
+        case DX_METHOD_HANDLE_INVOKE_INTERFACE: {
+            // Instance method: args[0] is receiver, rest are params
+            DxMethod *target = dx_vm_resolve_method(vm, (uint32_t)target_idx);
+            if (!target) {
+                DX_WARN(TAG, "invoke-method-handle: cannot resolve instance method %d", target_idx);
+                if (result) *result = DX_NULL_VALUE;
+                return DX_OK;
+            }
+            return dx_vm_execute_method(vm, target, args, (uint32_t)argc, result);
+        }
+
+        case DX_METHOD_HANDLE_INVOKE_CONSTRUCTOR: {
+            // Constructor: args[0] is the new-instance, invoke <init>
+            DxMethod *target = dx_vm_resolve_method(vm, (uint32_t)target_idx);
+            if (!target) {
+                DX_WARN(TAG, "invoke-method-handle: cannot resolve constructor %d", target_idx);
+                if (result) *result = DX_NULL_VALUE;
+                return DX_OK;
+            }
+            DxResult r = dx_vm_execute_method(vm, target, args, (uint32_t)argc, result);
+            // Constructor returns the instance
+            if (r == DX_OK && result && argc > 0) {
+                *result = args[0];
+            }
+            return r;
+        }
+
+        case DX_METHOD_HANDLE_INSTANCE_GET: {
+            // iget: args[0] is receiver object, result is field value
+            if (argc < 1 || args[0].tag != DX_VAL_OBJ || !args[0].obj) {
+                if (result) *result = DX_NULL_VALUE;
+                return DX_OK;
+            }
+            if (!dex || (uint32_t)target_idx >= dex->field_count) {
+                if (result) *result = DX_NULL_VALUE;
+                return DX_OK;
+            }
+            const char *fname = dx_dex_get_field_name(dex, (uint32_t)target_idx);
+            DxValue val;
+            if (dx_vm_get_field(args[0].obj, fname, &val) == DX_OK) {
+                if (result) *result = val;
+            } else {
+                if (result) *result = DX_NULL_VALUE;
+            }
+            return DX_OK;
+        }
+
+        case DX_METHOD_HANDLE_INSTANCE_PUT: {
+            // iput: args[0] is receiver, args[1] is value
+            if (argc < 2 || args[0].tag != DX_VAL_OBJ || !args[0].obj) {
+                if (result) *result = DX_NULL_VALUE;
+                return DX_OK;
+            }
+            if (!dex || (uint32_t)target_idx >= dex->field_count) {
+                if (result) *result = DX_NULL_VALUE;
+                return DX_OK;
+            }
+            const char *fname = dx_dex_get_field_name(dex, (uint32_t)target_idx);
+            dx_vm_set_field(args[0].obj, fname, args[1]);
+            if (result) *result = DX_NULL_VALUE;
+            return DX_OK;
+        }
+
+        case DX_METHOD_HANDLE_STATIC_GET: {
+            // sget: no receiver args, result is static field value
+            if (!dex || (uint32_t)target_idx >= dex->field_count) {
+                if (result) *result = DX_NULL_VALUE;
+                return DX_OK;
+            }
+            const char *fclass = dx_dex_get_field_class(dex, (uint32_t)target_idx);
+            const char *fname = dx_dex_get_field_name(dex, (uint32_t)target_idx);
+            DxClass *cls = fclass ? dx_vm_find_class(vm, fclass) : NULL;
+            if (cls && cls->static_fields && fname) {
+                // Search static fields by name
+                for (uint32_t i = 0; i < cls->static_field_count; i++) {
+                    if (cls->field_defs && cls->field_defs[i].name &&
+                        strcmp(cls->field_defs[i].name, fname) == 0) {
+                        if (result) *result = cls->static_fields[i];
+                        return DX_OK;
+                    }
+                }
+            }
+            if (result) *result = DX_NULL_VALUE;
+            return DX_OK;
+        }
+
+        case DX_METHOD_HANDLE_STATIC_PUT: {
+            // sput: args[0] is value to store
+            if (!dex || (uint32_t)target_idx >= dex->field_count) {
+                if (result) *result = DX_NULL_VALUE;
+                return DX_OK;
+            }
+            const char *fclass = dx_dex_get_field_class(dex, (uint32_t)target_idx);
+            const char *fname = dx_dex_get_field_name(dex, (uint32_t)target_idx);
+            DxClass *cls = fclass ? dx_vm_find_class(vm, fclass) : NULL;
+            if (cls && cls->static_fields && fname && argc > 0) {
+                for (uint32_t i = 0; i < cls->static_field_count; i++) {
+                    if (cls->field_defs && cls->field_defs[i].name &&
+                        strcmp(cls->field_defs[i].name, fname) == 0) {
+                        cls->static_fields[i] = args[0];
+                        break;
+                    }
+                }
+            }
+            if (result) *result = DX_NULL_VALUE;
+            return DX_OK;
+        }
+
+        default:
+            DX_WARN(TAG, "invoke-method-handle: unsupported handle kind %d", kind);
+            if (result) *result = DX_NULL_VALUE;
+            return DX_OK;
+    }
+}
+
 // ─── GC collect (public entry point for memory-pressure handling) ───
 
 void dx_vm_gc_collect(DxVM *vm) {
@@ -5209,4 +5401,21 @@ const char *dx_vm_get_missing_features(DxVM *vm) {
                         "  - %s\n", vm->missing_features.features[i]);
     }
     return buf;
+}
+
+// ---- Debug tracing API ----
+
+void dx_vm_set_trace(DxVM *vm, bool bytecode, bool class_load, bool method_call) {
+    if (!vm) return;
+    vm->debug.bytecode_trace = bytecode;
+    vm->debug.class_load_trace = class_load;
+    vm->debug.method_call_trace = method_call;
+    DX_INFO(TAG, "Trace config: bytecode=%d class_load=%d method_call=%d",
+            bytecode, class_load, method_call);
+}
+
+void dx_vm_set_trace_filter(DxVM *vm, const char *method_filter) {
+    if (!vm) return;
+    vm->debug.trace_method_filter = method_filter;
+    DX_INFO(TAG, "Trace filter: %s", method_filter ? method_filter : "(all)");
 }

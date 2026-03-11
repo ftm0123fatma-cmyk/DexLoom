@@ -96,6 +96,14 @@ DxUINode *dx_ui_node_create(DxViewType type, uint32_t view_id) {
     node->constraints.bottom_to_top = DX_CONSTRAINT_NONE;
     node->constraints.horizontal_bias = 0.5f;
     node->constraints.vertical_bias = 0.5f;
+    node->constraints.h_chain_style = DX_CHAIN_NONE;
+    node->constraints.v_chain_style = DX_CHAIN_NONE;
+
+    // Guideline defaults
+    node->is_guideline = false;
+    node->guideline_orientation = DX_GUIDELINE_VERTICAL;
+    node->guideline_percent = -1.0f;
+    node->guideline_begin = -1.0f;
 
     return node;
 }
@@ -350,6 +358,10 @@ static DxRenderNode *serialize_node(DxUINode *node) {
     rn->rel_left_of = node->rel_left_of;
     rn->rel_right_of = node->rel_right_of;
     rn->constraints = node->constraints;
+    rn->is_guideline = node->is_guideline;
+    rn->guideline_orientation = node->guideline_orientation;
+    rn->guideline_percent = node->guideline_percent;
+    rn->guideline_begin = node->guideline_begin;
     rn->image_data = node->image_data;        // borrow pointer (DxUINode owns the data)
     rn->image_data_len = node->image_data_len;
     rn->is_nine_patch = node->is_nine_patch;
@@ -2025,7 +2037,8 @@ DxResult dx_layout_parse(DxContext *ctx, const uint8_t *xml_data, uint32_t xml_s
                      strcmp(tag, "Space") == 0) vtype = DX_VIEW_VIEW;
             else if (strstr(tag, "RecyclerView") != NULL) vtype = DX_VIEW_RECYCLER_VIEW;
             else if (strstr(tag, "CardView") != NULL) vtype = DX_VIEW_CARD_VIEW;
-            else if (strstr(tag, "ConstraintLayout") != NULL) vtype = DX_VIEW_CONSTRAINT_LAYOUT;
+            else if (strstr(tag, "ConstraintLayout") != NULL && strstr(tag, "Guideline") == NULL) vtype = DX_VIEW_CONSTRAINT_LAYOUT;
+            else if (strstr(tag, "Guideline") != NULL) vtype = DX_VIEW_VIEW; // Guideline: invisible anchor, flagged below
             else if (strstr(tag, "FloatingActionButton") != NULL) vtype = DX_VIEW_FAB;
             else if (strstr(tag, "TabLayout") != NULL) vtype = DX_VIEW_TAB_LAYOUT;
             else if (strstr(tag, "ViewPager") != NULL) vtype = DX_VIEW_VIEW_PAGER;
@@ -2044,6 +2057,12 @@ DxResult dx_layout_parse(DxContext *ctx, const uint8_t *xml_data, uint32_t xml_s
 
             DxUINode *node = dx_ui_node_create(vtype, 0);
             if (!node) break;
+
+            // Detect Guideline tags
+            if (strstr(tag, "Guideline") != NULL) {
+                node->is_guideline = true;
+                node->visibility = DX_GONE; // Guidelines are invisible
+            }
 
             // Track style resource ID for this element
             uint32_t style_res_id = 0;
@@ -2449,6 +2468,42 @@ DxResult dx_layout_parse(DxContext *ctx, const uint8_t *xml_data, uint32_t xml_s
                         union { uint32_t u; float f; } conv;
                         conv.u = attr_data;
                         node->constraints.vertical_bias = conv.f;
+                    }
+                }
+                // Chain style attributes
+                else if (strcmp(attr_name, "layout_constraintHorizontal_chainStyle") == 0) {
+                    // 0=spread, 1=spread_inside, 2=packed (Android enum values)
+                    if (attr_data == 0) node->constraints.h_chain_style = DX_CHAIN_SPREAD;
+                    else if (attr_data == 1) node->constraints.h_chain_style = DX_CHAIN_SPREAD_INSIDE;
+                    else if (attr_data == 2) node->constraints.h_chain_style = DX_CHAIN_PACKED;
+                }
+                else if (strcmp(attr_name, "layout_constraintVertical_chainStyle") == 0) {
+                    if (attr_data == 0) node->constraints.v_chain_style = DX_CHAIN_SPREAD;
+                    else if (attr_data == 1) node->constraints.v_chain_style = DX_CHAIN_SPREAD_INSIDE;
+                    else if (attr_data == 2) node->constraints.v_chain_style = DX_CHAIN_PACKED;
+                }
+                // Guideline attributes
+                else if (strcmp(attr_name, "orientation") == 0 && node->is_guideline) {
+                    // 0=horizontal, 1=vertical
+                    node->guideline_orientation = (attr_data == 1) ? DX_GUIDELINE_VERTICAL : DX_GUIDELINE_HORIZONTAL;
+                }
+                else if (strcmp(attr_name, "layout_constraintGuide_begin") == 0) {
+                    if (node->is_guideline) {
+                        if (attr_type == 0x05) {
+                            // Dimension value: convert from Android encoded dp
+                            node->guideline_begin = (float)(attr_data >> 8);
+                        } else {
+                            node->guideline_begin = (float)attr_data;
+                        }
+                    }
+                }
+                else if (strcmp(attr_name, "layout_constraintGuide_percent") == 0) {
+                    if (node->is_guideline) {
+                        if (attr_type == 0x04) {
+                            union { uint32_t u; float f; } conv;
+                            conv.u = attr_data;
+                            node->guideline_percent = conv.f;
+                        }
                     }
                 }
             }

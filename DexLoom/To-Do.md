@@ -285,7 +285,7 @@ This is **not achievable** in full. The goal is to maximize the subset of APKs t
   - [x] Night mode qualifier (night, notnight) — parsed from uiMode byte; dx_runtime_set_night_mode() toggle
 - [x] [PARTIAL] **Drawable resources**
   - [x] PNG/JPEG decoding from res/drawable-* (via dx_ui_extract_drawable + UIImage)
-  - [ ] 9-patch PNG support
+  - [x] 9-patch PNG support (npTc chunk parsing, resizable cap insets, content padding)
   - [x] Vector drawable (AXML path data → SVG parser → SwiftUI Canvas rendering)
   - [x] StateListDrawable (selector XML → default item extraction → recursive drawable resolution)
   - [x] LayerDrawable (layer-list → topmost layer), ShapeDrawable (rectangle/oval with solid/gradient/corners/stroke → SwiftUI rendering)
@@ -495,15 +495,16 @@ This is **not achievable** in full. The goal is to maximize the subset of APKs t
   - [x] Implement bootstrap method invocation (LambdaMetafactory + StringConcatFactory detection)
   - [x] Handle StringConcatFactory (recipe string with \x01 placeholders)
   - [x] Handle LambdaMetafactory (synthetic DxClass, captured variables, native dispatch)
-- [ ] [MISSING] **invoke-polymorphic** — required for MethodHandle.invoke/invokeExact
-- [ ] [MISSING] const-method-handle / const-method-type real values
+- [x] [DONE] **invoke-polymorphic** — MethodHandle.invoke/invokeExact with all 9 handle kinds (invoke-static/instance/direct/interface/constructor, iget/iput/sget/sput)
+- [x] [DONE] **invoke-polymorphic/range** (0xFB) — range register variant
+- [x] [DONE] const-method-handle / const-method-type real values — wraps DxMethodHandle/DxDexProtoId in DxObject
 - [x] [DONE] Bounds check via CODE_AT() macro for safe code access
 - [x] [DONE] Validate register indices via CHECK_REG macro on critical opcodes
 - [x] [DONE] Integer overflow protection in div/rem (INT_MIN / -1 returns INT_MIN, INT_MIN % -1 returns 0)
 - [x] [DONE] Computed goto dispatch (gcc/clang extension) — 256-entry dispatch_table with per-opcode labels, DISPATCH_NEXT macro, switch fallback preserved
 - [ ] [OPTIMIZE] Register caching (avoid DxValue indirection for hot registers)
 - [ ] [OPTIMIZE] Inline caching for invoke-virtual (monomorphic/polymorphic)
-- [ ] [MISSING] Trace logging toggle per method (current TRACE level floods output)
+- [x] [DONE] Trace logging toggle per method — dx_vm_set_trace() + dx_vm_set_trace_filter() with prefix matching
 
 #### Exception Flow (Critical Fix)
 - [x] **[DONE] Call-stack exception unwinding implemented**
@@ -723,11 +724,11 @@ This is **not achievable** in full. The goal is to maximize the subset of APKs t
 - [x] [DONE] **EditText input** — SwiftUI TextField with text binding
   - [x] Bridge to SwiftUI TextField
   - [x] Handle onTextChanged callbacks (via dx_runtime_update_edit_text)
-  - [ ] Input type filtering (number, email, password)
+  - [x] Input type filtering (number/numberPad, email, password/SecureField, phone, URL, decimal)
 - [x] [DONE] **ImageView actual images**
   - [x] Load from res/drawable-* in APK
   - [x] Decode PNG/JPEG via iOS UIImage
-  - [ ] ScaleType support (centerCrop, fitCenter, fitXY)
+  - [x] ScaleType support (center, centerCrop, centerInside, fitCenter, fitXY, fitStart, fitEnd)
 - [x] [DONE] **RecyclerView with adapter**
   - [x] Call adapter methods to get item count and bind views (clamped to 50 items)
   - [x] Scroll and recycle (renders all items, no recycling)
@@ -898,13 +899,13 @@ This is **not achievable** in full. The goal is to maximize the subset of APKs t
 - [x] APKInspector CLI tool
 
 #### Remaining Work
-- [ ] [MISSING] **Bytecode trace mode**: log each instruction with register state (gated by method name filter)
-- [ ] [MISSING] **Class load trace**: log every class loaded with source DEX file
-- [ ] [MISSING] **Method call trace**: log method entry/exit with arguments
+- [x] [DONE] **Bytecode trace mode**: logs each instruction with PC, opcode, register state; gated by method name prefix filter
+- [x] [DONE] **Class load trace**: logs every class loaded with source DEX file index
+- [x] [DONE] **Method call trace**: logs method entry/exit with class, method name, depth, arg count; indented by call depth
 - [x] [DONE] **UI tree inspector**: dx_ui_tree_dump() with indented tree view; accessible from Logs toolbar
 - [ ] [MISSING] **Resource resolution inspector**: show resource ID → value resolution chain
-- [ ] [MISSING] **Manifest inspector**: in-app view of parsed manifest fields
-- [ ] [MISSING] **DEX browser**: in-app class/method/field browser
+- [x] [DONE] **Manifest inspector**: in-app view with package info, activities, services, receivers, providers, permissions, features; intent filter display
+- [x] [DONE] **DEX browser**: in-app searchable class list with method/field detail view; monospace code-browser style; access flags display
 - [x] [DONE] **Heap inspector**: dx_vm_heap_stats() with capacity/live/top-10 classes; accessible from Logs toolbar
 - [x] [DONE] **Stack trace on error**: dx_vm_get_last_error_detail() captures method/pc/opcode/registers/call-chain; accessible from Logs toolbar
 - [ ] [MISSING] **Structured log format**: JSON logs for machine processing
@@ -1001,13 +1002,12 @@ This is **not achievable** in full. The goal is to maximize the subset of APKs t
 - **No remaining blockers** for basic productivity apps
 
 #### Tier 3: Resource-Heavy Commercial Apps
-**Status: MOSTLY ACHIEVED**
+**Status: ACHIEVED**
 - Complex theme/style hierarchies — DONE (style parent chain traversal, theme resolution, ?attr/ references)
-- Bitmap/drawable heavy — DONE (PNG/JPEG extraction from APK, ImageView renders real images)
-- Multiple languages/densities — DONE (qualifier system with locale, density, orientation, SDK level scoring)
+- Bitmap/drawable heavy — DONE (PNG/JPEG, vector drawables, 9-patch, shape, selector, layer-list)
+- Multiple languages/densities — DONE (qualifier system with locale, density, orientation, SDK, night mode, screen size)
 - Background services — DONE (startService→onCreate→onStartCommand; IntentService)
-- **Remaining blockers**: No 9-patch PNG
-- **Required subsystems**: 9-patch PNG parsing
+- **No remaining blockers**
 
 #### Tier 4: JNI-Heavy Apps
 **Status: NOT ACHIEVABLE (JAILED iOS)**
@@ -1285,13 +1285,13 @@ This is **not achievable** in full. The goal is to maximize the subset of APKs t
 ## 8. Production Hardening Backlog
 
 - [x] **Crash isolation**: SIGSEGV/SIGBUS signal handlers with sigsetjmp/siglongjmp recovery; DX_ERR_SIGNAL
-- [ ] **Memory pressure handling**: Register for iOS memory warnings; trigger aggressive GC
-- [ ] **Watchdog**: Detect interpreter stuck for >10 seconds; abort with diagnostic
+- [x] **Memory pressure handling**: iOS didReceiveMemoryWarningNotification triggers dx_vm_gc_collect()
+- [x] **Watchdog**: 10s wall-clock timeout via mach_absolute_time, checked every 10000 insns; DX_ERR_BUDGET_EXHAUSTED
 - [ ] **UI freeze prevention**: Run interpreter on background thread; bridge results to main thread
 - [x] **Deterministic diagnostics**: dx_vm_get_last_error_detail() captures method name, pc, opcode, register snapshot, call chain
 - [ ] **Large APK resilience**: Stream-process APKs >50MB instead of loading to memory
 - [ ] **Corruption resistance**: Validate all pointer dereferences in interpreter hot path
-- [ ] **Graceful unsupported features**: When an APK uses unsupported features, present user-facing message listing what's missing
+- [x] **Graceful unsupported features**: dx_vm_report_missing_feature() tracks class-not-found, System.loadLibrary, invoke-polymorphic; missingFeaturesReport() in Swift
 - [ ] **Release gating criteria**: Define minimum test pass rate (e.g., 95% of test suite) before release
 - [ ] **Telemetry**: Optional opt-in crash/compatibility reporting
 

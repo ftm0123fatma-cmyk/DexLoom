@@ -104,6 +104,18 @@ struct AndroidViewRenderer: View {
     let bridge: RuntimeBridge
 
     var body: some View {
+        // Handle Android view visibility: VISIBLE=0, INVISIBLE=4, GONE=8
+        if node.visibility == DX_GONE {
+            // GONE: takes no space at all
+            EmptyView()
+        } else {
+            viewContent
+                .opacity(node.visibility == DX_INVISIBLE ? 0 : 1)
+        }
+    }
+
+    @ViewBuilder
+    private var viewContent: some View {
         if !node.drawCommands.isEmpty {
             // View with Canvas draw commands — render using SwiftUI Canvas
             CanvasDrawView(commands: node.drawCommands, node: node)
@@ -373,6 +385,7 @@ struct AndroidViewRenderer: View {
             initialText: node.text ?? "",
             hint: node.hint ?? "",
             textSize: sp(node.textSize),
+            inputType: node.inputType,
             viewId: node.viewId,
             bridge: bridge
         )
@@ -410,10 +423,37 @@ struct AndroidViewRenderer: View {
                             trailing: CGFloat(node.ninePatchPadding.2)
                         ))
                 } else {
-                    Image(uiImage: uiImage)
-                        .resizable()
-                        .aspectRatio(contentMode: .fit)
-                        .frame(maxWidth: .infinity, minHeight: 40)
+                    // Apply scaleType: 0=fitCenter, 1=center, 2=centerCrop, 3=centerInside, 4=fitXY, 5=fitStart, 6=fitEnd
+                    switch node.scaleType {
+                    case 2: // centerCrop
+                        Image(uiImage: uiImage)
+                            .resizable()
+                            .scaledToFill()
+                            .frame(maxWidth: .infinity, minHeight: 40)
+                            .clipped()
+                    case 4: // fitXY - stretch without preserving aspect ratio
+                        Image(uiImage: uiImage)
+                            .resizable()
+                            .frame(maxWidth: .infinity, minHeight: 40)
+                    case 1: // center - no resizing, natural size
+                        Image(uiImage: uiImage)
+                            .frame(maxWidth: .infinity, minHeight: 40)
+                    case 5: // fitStart - fit with top-leading alignment
+                        Image(uiImage: uiImage)
+                            .resizable()
+                            .scaledToFit()
+                            .frame(maxWidth: .infinity, minHeight: 40, alignment: .topLeading)
+                    case 6: // fitEnd - fit with bottom-trailing alignment
+                        Image(uiImage: uiImage)
+                            .resizable()
+                            .scaledToFit()
+                            .frame(maxWidth: .infinity, minHeight: 40, alignment: .bottomTrailing)
+                    default: // 0=fitCenter, 3=centerInside - fit preserving aspect ratio
+                        Image(uiImage: uiImage)
+                            .resizable()
+                            .scaledToFit()
+                            .frame(maxWidth: .infinity, minHeight: 40)
+                    }
                 }
             } else {
                 Image(systemName: "photo")
@@ -870,21 +910,35 @@ private struct ConstraintLayoutView: View {
         GeometryReader { geo in
             let parentW = geo.size.width
             let parentH = geo.size.height
+            let hChains = detectHorizontalChains()
+            let vChains = detectVerticalChains()
+            let chainMemberIds = collectChainMemberIds(hChains: hChains, vChains: vChains)
 
             ZStack(alignment: .topLeading) {
+                // Render horizontal chains
+                ForEach(Array(hChains.enumerated()), id: \.offset) { _, chain in
+                    renderHorizontalChain(chain, parentSize: geo.size)
+                }
+                // Render vertical chains
+                ForEach(Array(vChains.enumerated()), id: \.offset) { _, chain in
+                    renderVerticalChain(chain, parentSize: geo.size)
+                }
+                // Render non-chain, non-guideline children individually
                 ForEach(node.children) { child in
-                    let solved = solveChild(child, parentSize: geo.size)
-                    AndroidViewRenderer(node: child, bridge: bridge)
-                        .frame(
-                            width: solved.width,
-                            height: solved.height
-                        )
-                        .frame(
-                            maxWidth: solved.maxWidth,
-                            maxHeight: solved.maxHeight
-                        )
-                        .alignmentGuide(.leading) { _ in -solved.x }
-                        .alignmentGuide(.top) { _ in -solved.y }
+                    if !child.isGuideline && !chainMemberIds.contains(child.viewId) {
+                        let solved = solveChild(child, parentSize: geo.size)
+                        AndroidViewRenderer(node: child, bridge: bridge)
+                            .frame(
+                                width: solved.width,
+                                height: solved.height
+                            )
+                            .frame(
+                                maxWidth: solved.maxWidth,
+                                maxHeight: solved.maxHeight
+                            )
+                            .alignmentGuide(.leading) { _ in -solved.x }
+                            .alignmentGuide(.top) { _ in -solved.y }
+                    }
                 }
             }
             .frame(width: parentW, height: parentH, alignment: .topLeading)
@@ -1084,25 +1138,70 @@ private struct ConstraintLayoutView: View {
         return nil
     }
 
+    // MARK: - Guideline position resolution
+
+    /// Compute a guideline's position in parent coordinates
+    private func guidelinePosition(_ guideline: RenderNode, parentSize: CGSize) -> CGFloat {
+        if guideline.guidelineOrientation == 1 {
+            // Vertical guideline: provides an X position
+            if guideline.guidelinePercent >= 0 {
+                return parentSize.width * CGFloat(guideline.guidelinePercent)
+            } else if guideline.guidelineBegin >= 0 {
+                return dp(Int32(guideline.guidelineBegin))
+            }
+            return 0
+        } else {
+            // Horizontal guideline: provides a Y position
+            if guideline.guidelinePercent >= 0 {
+                return parentSize.height * CGFloat(guideline.guidelinePercent)
+            } else if guideline.guidelineBegin >= 0 {
+                return dp(Int32(guideline.guidelineBegin))
+            }
+            return 0
+        }
+    }
+
     // MARK: - Sibling edge estimation
     // For sibling-to-sibling constraints, we do a simplified single-pass estimation.
     // We estimate sibling positions based on their own constraints to parent only.
     // This handles the most common chains (A→parent, B→A's bottom, etc.)
+    // Guidelines are resolved by computing their fixed position.
 
     private func findSiblingLeftEdge(_ viewId: UInt32) -> CGFloat? {
-        // Sibling's left edge is its x position (margin included)
         guard let sibling = node.children.first(where: { $0.viewId == viewId }) else { return nil }
+        // If sibling is a guideline, return its computed position
+        if sibling.isGuideline {
+            // Vertical guideline provides a left/right edge (X position)
+            if sibling.guidelineOrientation == 1 {
+                // Need parent size; estimate from node width or use 0
+                // We don't have parentSize here, so use percent * estimated width
+                return guidelinePositionEstimate(sibling, isHorizontalAxis: true)
+            }
+            return nil
+        }
         return dp(sibling.margin.0)
     }
 
     private func findSiblingRightEdge(_ viewId: UInt32) -> CGFloat? {
         guard let sibling = node.children.first(where: { $0.viewId == viewId }) else { return nil }
+        if sibling.isGuideline {
+            if sibling.guidelineOrientation == 1 {
+                return guidelinePositionEstimate(sibling, isHorizontalAxis: true)
+            }
+            return nil
+        }
         let w: CGFloat = sibling.width > 0 ? dp(sibling.width) : 100 // estimate
         return dp(sibling.margin.0) + w
     }
 
     private func findSiblingTopEdge(_ viewId: UInt32) -> CGFloat? {
         guard let sibling = node.children.first(where: { $0.viewId == viewId }) else { return nil }
+        if sibling.isGuideline {
+            if sibling.guidelineOrientation == 0 {
+                return guidelinePositionEstimate(sibling, isHorizontalAxis: false)
+            }
+            return nil
+        }
         // If sibling is constrained to parent top, its top is its top margin
         if sibling.constraints.topToTop == kConstraintParent {
             return dp(sibling.margin.1)
@@ -1118,11 +1217,285 @@ private struct ConstraintLayoutView: View {
 
     private func findSiblingBottomEdge(_ viewId: UInt32) -> CGFloat? {
         guard let sibling = node.children.first(where: { $0.viewId == viewId }) else { return nil }
+        if sibling.isGuideline {
+            if sibling.guidelineOrientation == 0 {
+                return guidelinePositionEstimate(sibling, isHorizontalAxis: false)
+            }
+            return nil
+        }
         let h: CGFloat = sibling.height > 0 ? dp(sibling.height) : 48 // estimate
         if let top = findSiblingTopEdge(viewId) {
             return top + h + dp(sibling.margin.3)
         }
         return dp(sibling.margin.1) + h + dp(sibling.margin.3)
+    }
+
+    /// Estimate guideline position without parent size (uses node's own dimensions as fallback)
+    private func guidelinePositionEstimate(_ gl: RenderNode, isHorizontalAxis: Bool) -> CGFloat {
+        if gl.guidelineBegin >= 0 {
+            return dp(Int32(gl.guidelineBegin))
+        }
+        if gl.guidelinePercent >= 0 {
+            // Estimate parent dimension from node width/height
+            let parentDim: CGFloat
+            if isHorizontalAxis {
+                parentDim = node.width > 0 ? dp(node.width) : 390 // iPhone default
+            } else {
+                parentDim = node.height > 0 ? dp(node.height) : 844
+            }
+            return parentDim * CGFloat(gl.guidelinePercent)
+        }
+        return 0
+    }
+
+    // MARK: - Chain detection and rendering
+
+    /// A chain is a sequence of views linked left-to-right (horizontal) or top-to-bottom (vertical)
+    struct Chain {
+        let members: [RenderNode]
+        let style: UInt8  // 0=none/spread, 1=spread, 2=spread_inside, 3=packed
+    }
+
+    /// Detect horizontal chains among children
+    private func detectHorizontalChains() -> [Chain] {
+        var chains: [Chain] = []
+        var visited = Set<UInt32>()
+
+        for child in node.children where !child.isGuideline && !visited.contains(child.viewId) {
+            // A chain head has h_chain_style set OR is the leftmost in a mutual constraint sequence
+            guard child.constraints.hChainStyle != 0 else { continue }
+
+            // Walk the chain: follow left_to_right / right_to_left links
+            var members: [RenderNode] = [child]
+            visited.insert(child.viewId)
+
+            // Walk forward: find views whose left is constrained to current view's right
+            var currentId = child.viewId
+            while true {
+                if let next = node.children.first(where: {
+                    !visited.contains($0.viewId) &&
+                    !$0.isGuideline &&
+                    ($0.constraints.leftToRight == currentId)
+                }) {
+                    members.append(next)
+                    visited.insert(next.viewId)
+                    currentId = next.viewId
+                } else {
+                    break
+                }
+            }
+
+            if members.count > 1 {
+                chains.append(Chain(members: members, style: child.constraints.hChainStyle))
+            } else {
+                // Single view with chain style set but no chain found - remove from visited
+                // so it renders normally
+                visited.remove(child.viewId)
+            }
+        }
+        return chains
+    }
+
+    /// Detect vertical chains among children
+    private func detectVerticalChains() -> [Chain] {
+        var chains: [Chain] = []
+        var visited = Set<UInt32>()
+
+        for child in node.children where !child.isGuideline && !visited.contains(child.viewId) {
+            guard child.constraints.vChainStyle != 0 else { continue }
+
+            var members: [RenderNode] = [child]
+            visited.insert(child.viewId)
+
+            var currentId = child.viewId
+            while true {
+                if let next = node.children.first(where: {
+                    !visited.contains($0.viewId) &&
+                    !$0.isGuideline &&
+                    ($0.constraints.topToBottom == currentId)
+                }) {
+                    members.append(next)
+                    visited.insert(next.viewId)
+                    currentId = next.viewId
+                } else {
+                    break
+                }
+            }
+
+            if members.count > 1 {
+                chains.append(Chain(members: members, style: child.constraints.vChainStyle))
+            } else {
+                visited.remove(child.viewId)
+            }
+        }
+        return chains
+    }
+
+    /// Collect all view IDs that belong to any chain (so they are not rendered individually)
+    private func collectChainMemberIds(hChains: [Chain], vChains: [Chain]) -> Set<UInt32> {
+        var ids = Set<UInt32>()
+        for chain in hChains {
+            for m in chain.members { ids.insert(m.viewId) }
+        }
+        for chain in vChains {
+            for m in chain.members { ids.insert(m.viewId) }
+        }
+        return ids
+    }
+
+    /// Solved chain member position
+    struct ChainMemberPosition {
+        let index: Int
+        let x: CGFloat
+        let y: CGFloat
+    }
+
+    /// Compute x positions for a horizontal chain
+    private func solveHorizontalChainPositions(_ chain: Chain, parentSize: CGSize) -> (yPos: CGFloat, positions: [CGFloat]) {
+        let parentW = parentSize.width
+        let first = chain.members[0]
+        let c = first.constraints
+
+        let topEdge = resolveTopEdge(c, parentH: parentSize.height)
+        let yPos = (topEdge ?? 0) + dp(first.margin.1)
+
+        let leftBound = resolveLeftEdge(c, parentW: parentW) ?? 0
+        let lastC = chain.members[chain.members.count - 1].constraints
+        let rightBound = resolveRightEdge(lastC, parentW: parentW) ?? parentW
+        let availableW = rightBound - leftBound
+
+        let totalChildW: CGFloat = chain.members.reduce(0) { sum, m in
+            let w: CGFloat = m.width > 0 ? dp(m.width) : 80
+            return sum + w + dp(m.margin.0) + dp(m.margin.2)
+        }
+
+        let remainingSpace = max(availableW - totalChildW, 0)
+        let count = CGFloat(chain.members.count)
+
+        var xPositions: [CGFloat] = []
+
+        if chain.style == 2 {
+            // spread_inside
+            let gap = count > 1 ? remainingSpace / (count - 1) : 0
+            var x = leftBound
+            for (i, m) in chain.members.enumerated() {
+                xPositions.append(x + dp(m.margin.0))
+                let w: CGFloat = m.width > 0 ? dp(m.width) : 80
+                x += dp(m.margin.0) + w + dp(m.margin.2)
+                if i < chain.members.count - 1 { x += gap }
+            }
+        } else if chain.style == 3 {
+            // packed
+            let bias = CGFloat(first.constraints.horizontalBias)
+            let startX = leftBound + remainingSpace * bias
+            var x = startX
+            for m in chain.members {
+                xPositions.append(x + dp(m.margin.0))
+                let w: CGFloat = m.width > 0 ? dp(m.width) : 80
+                x += dp(m.margin.0) + w + dp(m.margin.2)
+            }
+        } else {
+            // spread (default, style 1 or 0)
+            let gap = count > 0 ? remainingSpace / (count + 1) : 0
+            var x = leftBound + gap
+            for m in chain.members {
+                xPositions.append(x + dp(m.margin.0))
+                let w: CGFloat = m.width > 0 ? dp(m.width) : 80
+                x += dp(m.margin.0) + w + dp(m.margin.2) + gap
+            }
+        }
+
+        return (yPos, xPositions)
+    }
+
+    /// Compute y positions for a vertical chain
+    private func solveVerticalChainPositions(_ chain: Chain, parentSize: CGSize) -> (xPos: CGFloat, positions: [CGFloat]) {
+        let parentH = parentSize.height
+        let first = chain.members[0]
+        let c = first.constraints
+
+        let leftEdge = resolveLeftEdge(c, parentW: parentSize.width)
+        let xPos = (leftEdge ?? 0) + dp(first.margin.0)
+
+        let topBound = resolveTopEdge(c, parentH: parentH) ?? 0
+        let lastC = chain.members[chain.members.count - 1].constraints
+        let bottomBound = resolveBottomEdge(lastC, parentH: parentH) ?? parentH
+        let availableH = bottomBound - topBound
+
+        let totalChildH: CGFloat = chain.members.reduce(0) { sum, m in
+            let h: CGFloat = m.height > 0 ? dp(m.height) : 48
+            return sum + h + dp(m.margin.1) + dp(m.margin.3)
+        }
+
+        let remainingSpace = max(availableH - totalChildH, 0)
+        let count = CGFloat(chain.members.count)
+
+        var yPositions: [CGFloat] = []
+
+        if chain.style == 2 {
+            // spread_inside
+            let gap = count > 1 ? remainingSpace / (count - 1) : 0
+            var y = topBound
+            for (i, m) in chain.members.enumerated() {
+                yPositions.append(y + dp(m.margin.1))
+                let h: CGFloat = m.height > 0 ? dp(m.height) : 48
+                y += dp(m.margin.1) + h + dp(m.margin.3)
+                if i < chain.members.count - 1 { y += gap }
+            }
+        } else if chain.style == 3 {
+            // packed
+            let bias = CGFloat(first.constraints.verticalBias)
+            let startY = topBound + remainingSpace * bias
+            var y = startY
+            for m in chain.members {
+                yPositions.append(y + dp(m.margin.1))
+                let h: CGFloat = m.height > 0 ? dp(m.height) : 48
+                y += dp(m.margin.1) + h + dp(m.margin.3)
+            }
+        } else {
+            // spread (default)
+            let gap = count > 0 ? remainingSpace / (count + 1) : 0
+            var y = topBound + gap
+            for m in chain.members {
+                yPositions.append(y + dp(m.margin.1))
+                let h: CGFloat = m.height > 0 ? dp(m.height) : 48
+                y += dp(m.margin.1) + h + dp(m.margin.3) + gap
+            }
+        }
+
+        return (xPos, yPositions)
+    }
+
+    /// Render a horizontal chain using the specified distribution style
+    @ViewBuilder
+    private func renderHorizontalChain(_ chain: Chain, parentSize: CGSize) -> some View {
+        let solved = solveHorizontalChainPositions(chain, parentSize: parentSize)
+
+        ForEach(Array(chain.members.enumerated()), id: \.element.id) { idx, member in
+            let xPos = idx < solved.positions.count ? solved.positions[idx] : 0
+            let w: CGFloat? = member.width > 0 ? dp(member.width) : nil
+            let h: CGFloat? = member.height > 0 ? dp(member.height) : nil
+            AndroidViewRenderer(node: member, bridge: bridge)
+                .frame(width: w, height: h)
+                .alignmentGuide(.leading) { _ in -xPos }
+                .alignmentGuide(.top) { _ in -solved.yPos }
+        }
+    }
+
+    /// Render a vertical chain using the specified distribution style
+    @ViewBuilder
+    private func renderVerticalChain(_ chain: Chain, parentSize: CGSize) -> some View {
+        let solved = solveVerticalChainPositions(chain, parentSize: parentSize)
+
+        ForEach(Array(chain.members.enumerated()), id: \.element.id) { idx, member in
+            let yP = idx < solved.positions.count ? solved.positions[idx] : 0
+            let w: CGFloat? = member.width > 0 ? dp(member.width) : nil
+            let h: CGFloat? = member.height > 0 ? dp(member.height) : nil
+            AndroidViewRenderer(node: member, bridge: bridge)
+                .frame(width: w, height: h)
+                .alignmentGuide(.leading) { _ in -solved.xPos }
+                .alignmentGuide(.top) { _ in -yP }
+        }
     }
 }
 
@@ -1132,27 +1505,53 @@ private struct EditTextFieldView: View {
     let initialText: String
     let hint: String
     let textSize: CGFloat
+    let inputType: UInt32
     let viewId: UInt32
     let bridge: RuntimeBridge
 
     @State private var text: String = ""
     @FocusState private var isFocused: Bool
 
+    /// Whether this is a password field (inputType 0x81 = textPassword, 0x12 = numberPassword, 0x91 = textVisiblePassword)
+    private var isPassword: Bool {
+        inputType == 0x81 || inputType == 0x12 || inputType == 0x91
+    }
+
+    /// Keyboard type based on Android inputType value
+    private var keyboardType: UIKeyboardType {
+        switch inputType {
+        case 0x02: return .numberPad           // number
+        case 0x21: return .emailAddress         // textEmailAddress
+        case 0x11: return .URL                  // textUri
+        case 0x03: return .phonePad             // phone
+        case 0x2002: return .decimalPad         // numberDecimal
+        default: return .default
+        }
+    }
+
     var body: some View {
-        TextField(hint, text: $text)
-            .font(.system(size: max(textSize, 1)))
-            .padding(.horizontal, 8)
-            .frame(maxWidth: .infinity)
-            .frame(height: 44)
-            .background(
-                RoundedRectangle(cornerRadius: 4)
-                    .stroke(isFocused ? Color.blue : Color.gray.opacity(0.4), lineWidth: isFocused ? 2 : 1)
-            )
-            .focused($isFocused)
-            .onAppear { text = initialText }
-            .onChange(of: text) { _, newValue in
-                bridge.updateEditText(viewId: viewId, text: newValue)
+        Group {
+            if isPassword {
+                SecureField(hint, text: $text)
+                    .font(.system(size: max(textSize, 1)))
+            } else {
+                TextField(hint, text: $text)
+                    .font(.system(size: max(textSize, 1)))
+                    .keyboardType(keyboardType)
             }
+        }
+        .padding(.horizontal, 8)
+        .frame(maxWidth: .infinity)
+        .frame(height: 44)
+        .background(
+            RoundedRectangle(cornerRadius: 4)
+                .stroke(isFocused ? Color.blue : Color.gray.opacity(0.4), lineWidth: isFocused ? 2 : 1)
+        )
+        .focused($isFocused)
+        .onAppear { text = initialText }
+        .onChange(of: text) { _, newValue in
+            bridge.updateEditText(viewId: viewId, text: newValue)
+        }
     }
 }
 
