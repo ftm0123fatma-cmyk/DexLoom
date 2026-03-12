@@ -29,6 +29,7 @@ static void append_string(char ***array, uint32_t *count, const char *str) {
 #define AXML_FILE_MAGIC        0x00080003
 #define AXML_MAX_DEPTH         100    // Maximum XML nesting depth
 #define AXML_MAX_STRING_POOL   1000000 // Maximum string pool entries (1M)
+#define DX_MAX_AXML_SIZE       (50u * 1024u * 1024u)  // 50 MB limit for AXML data
 
 // Well-known Android resource IDs
 #define ATTR_NAME       0x01010003
@@ -79,17 +80,27 @@ static char *decode_axml_string(const uint8_t *pool_data, uint32_t pool_size,
         if (byte_count > 0x7F) {
             byte_count = ((byte_count & 0x7F) << 8) | *p++;
         }
+        // Cap individual string length at 1MB to prevent absurd allocations
+        if (byte_count > 1048576) {
+            DX_WARN(TAG, "AXML string too large: %u bytes (max 1MB), truncating", byte_count);
+            byte_count = 1048576;
+        }
         char *s = (char *)dx_malloc(byte_count + 1);
         if (!s) return NULL;
         memcpy(s, p, byte_count);
         s[byte_count] = '\0';
         return s;
     } else {
-        uint16_t char_count = read_u16(p);
+        uint32_t char_count = read_u16(p);
         p += 2;
         if (char_count >= 0x8000) {
             char_count = ((char_count & 0x7FFF) << 16) | read_u16(p);
             p += 2;
+        }
+        // Cap individual string length at 1MB to prevent absurd allocations
+        if (char_count > 349525) {  // 349525 * 3 + 1 ~ 1MB
+            DX_WARN(TAG, "AXML UTF-16 string too large: %u chars (max ~349K), truncating", char_count);
+            char_count = 349525;
         }
         // Worst case: each UTF-16 code unit -> 3 bytes UTF-8, surrogate pair -> 4 bytes
         char *s = (char *)dx_malloc(char_count * 3 + 1);
@@ -137,6 +148,10 @@ static char *decode_axml_string(const uint8_t *pool_data, uint32_t pool_size,
 DxResult dx_axml_parse(const uint8_t *data, uint32_t size, DxAxmlParser **out) {
     if (!data || !out) return DX_ERR_NULL_PTR;
     if (size < 8) return DX_ERR_AXML_INVALID;
+    if (size > DX_MAX_AXML_SIZE) {
+        DX_ERROR(TAG, "AXML data too large: %u bytes (limit %u)", size, DX_MAX_AXML_SIZE);
+        return DX_ERR_AXML_INVALID;
+    }
 
     uint32_t magic = read_u32(data);
     if (magic != AXML_FILE_MAGIC) {
@@ -411,6 +426,10 @@ typedef enum {
 
 DxResult dx_manifest_parse(const uint8_t *data, uint32_t size, DxManifest **out) {
     if (!data || !out) return DX_ERR_NULL_PTR;
+    if (size > DX_MAX_AXML_SIZE) {
+        DX_ERROR(TAG, "Manifest data too large: %u bytes (limit %u)", size, DX_MAX_AXML_SIZE);
+        return DX_ERR_AXML_INVALID;
+    }
 
     DxAxmlParser *axml = NULL;
     DxResult res = dx_axml_parse(data, size, &axml);

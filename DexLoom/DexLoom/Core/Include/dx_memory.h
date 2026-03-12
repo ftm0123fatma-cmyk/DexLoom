@@ -6,6 +6,7 @@
 
 // Memory allocation functions
 void *dx_malloc(size_t size);
+void *dx_calloc(size_t count, size_t size);
 void *dx_realloc(void *ptr, size_t size);
 void  dx_free(void *ptr);
 char *dx_strdup(const char *s);

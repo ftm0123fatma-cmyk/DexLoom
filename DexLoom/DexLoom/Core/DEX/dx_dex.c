@@ -7,6 +7,7 @@
 #include <CommonCrypto/CommonDigest.h>
 
 #define TAG "DEX"
+#define DX_MAX_DEX_SIZE (100u * 1024u * 1024u)  // 100 MB limit for DEX files
 
 #include "../Include/dx_memory.h"
 
@@ -34,8 +35,11 @@ static uint32_t read_uleb128(const uint8_t **pp) {
 }
 
 // Decode MUTF-8 string from DEX string_data section
-static char *decode_mutf8(const uint8_t *data, uint32_t offset, uint32_t file_size) {
-    if (offset >= file_size) return dx_strdup("");
+// If arena is non-NULL, allocates from the arena; otherwise uses dx_malloc.
+static char *decode_mutf8_ex(const uint8_t *data, uint32_t offset, uint32_t file_size, DxArena *arena) {
+    if (offset >= file_size) {
+        return arena ? dx_arena_strdup(arena, "") : dx_strdup("");
+    }
 
     const uint8_t *p = data + offset;
     const uint8_t *end = data + file_size;
@@ -44,7 +48,8 @@ static char *decode_mutf8(const uint8_t *data, uint32_t offset, uint32_t file_si
 
     // Allocate output buffer (max 3 bytes per UTF-16 code unit + null)
     size_t max_len = (size_t)utf16_size * 3 + 1;
-    char *s = (char *)dx_malloc(max_len);
+    char *s = arena ? (char *)dx_arena_alloc(arena, max_len)
+                    : (char *)dx_malloc(max_len);
     if (!s) return NULL;
 
     size_t out = 0;
@@ -85,10 +90,19 @@ static char *decode_mutf8(const uint8_t *data, uint32_t offset, uint32_t file_si
     return s;
 }
 
+// Legacy wrapper for non-arena callers
+static char *decode_mutf8(const uint8_t *data, uint32_t offset, uint32_t file_size) {
+    return decode_mutf8_ex(data, offset, file_size, NULL);
+}
+
 DxResult dx_dex_parse(const uint8_t *data, uint32_t size, DxDexFile **out) {
     if (!data || !out) return DX_ERR_NULL_PTR;
     if (size < sizeof(DxDexHeader)) {
         DX_ERROR(TAG, "File too small: %u bytes", size);
+        return DX_ERR_INVALID_FORMAT;
+    }
+    if (size > DX_MAX_DEX_SIZE) {
+        DX_ERROR(TAG, "DEX file too large: %u bytes (limit %u)", size, DX_MAX_DEX_SIZE);
         return DX_ERR_INVALID_FORMAT;
     }
 
@@ -107,6 +121,13 @@ DxResult dx_dex_parse(const uint8_t *data, uint32_t size, DxDexFile **out) {
 
     dex->raw_data = data;
     dex->raw_size = size;
+
+    // Create arena for parse-time allocations (string tables)
+    dex->arena = dx_arena_create(0);  // default 64 KB blocks
+    if (!dex->arena) {
+        dx_free(dex);
+        return DX_ERR_OUT_OF_MEMORY;
+    }
 
     // Parse header
     memcpy(&dex->header, data, sizeof(DxDexHeader));
@@ -311,11 +332,12 @@ DxResult dx_dex_parse(const uint8_t *data, uint32_t size, DxDexFile **out) {
         dx_free(dex);
         return DX_ERR_INVALID_FORMAT;
     }
-    dex->strings = (char **)dx_malloc(sizeof(char *) * dex->string_count);
+    dex->strings = (char **)dx_arena_calloc(dex->arena, dex->string_count, sizeof(char *));
     if (!dex->strings) goto fail;
-    // strings[] initialized to NULL by dx_malloc (lazy decode on first access)
+    // strings[] initialized to NULL (lazy decode on first access)
 
-    dex->string_data_offsets = (uint32_t *)dx_malloc(sizeof(uint32_t) * dex->string_count);
+    dex->string_data_offsets = (uint32_t *)dx_arena_alloc(dex->arena,
+                                    sizeof(uint32_t) * dex->string_count);
     if (!dex->string_data_offsets) goto fail;
 
     for (uint32_t i = 0; i < dex->string_count; i++) {
@@ -392,8 +414,8 @@ DxResult dx_dex_parse(const uint8_t *data, uint32_t size, DxDexFile **out) {
 
     // Parse class definitions
     dex->class_count = dex->header.class_defs_size;
-    if (dex->class_count > 5000000) {  // 5M classes max
-        DX_ERROR(TAG, "Class count %u would overflow allocation", dex->class_count);
+    if (dex->class_count > 100000) {  // 100K classes max per DEX
+        DX_ERROR(TAG, "Class count %u exceeds sanity limit (max 100000)", dex->class_count);
         goto fail;
     }
     dex->class_defs = (DxDexClassDef *)dx_malloc(sizeof(DxDexClassDef) * dex->class_count);
@@ -435,11 +457,12 @@ fail:
 void dx_dex_free(DxDexFile *dex) {
     if (!dex) return;
 
-    for (uint32_t i = 0; i < dex->string_count; i++) {
-        dx_free(dex->strings[i]);
-    }
-    dx_free(dex->strings);
-    dx_free(dex->string_data_offsets);
+    // strings[] and string_data_offsets are arena-allocated; destroy arena
+    dx_arena_destroy(dex->arena);
+    dex->arena = NULL;
+    dex->strings = NULL;
+    dex->string_data_offsets = NULL;
+
     dx_free(dex->type_ids);
     dx_free(dex->proto_ids);
     dx_free(dex->field_ids);
@@ -475,9 +498,10 @@ const char *dx_dex_get_string(const DxDexFile *dex, uint32_t idx) {
         DxDexFile *mutable_dex = (DxDexFile *)dex;
         uint32_t off = dex->string_data_offsets ? dex->string_data_offsets[idx] : UINT32_MAX;
         if (off == UINT32_MAX || off >= dex->raw_size) {
-            mutable_dex->strings[idx] = dx_strdup("");
+            mutable_dex->strings[idx] = dx_arena_strdup(mutable_dex->arena, "");
         } else {
-            mutable_dex->strings[idx] = decode_mutf8(dex->raw_data, off, dex->raw_size);
+            mutable_dex->strings[idx] = decode_mutf8_ex(dex->raw_data, off, dex->raw_size,
+                                                         mutable_dex->arena);
         }
     }
     return dex->strings[idx];
@@ -549,7 +573,7 @@ DxResult dx_dex_parse_class_data(DxDexFile *dex, uint32_t class_def_idx) {
 
     // Parse direct methods
     if (direct_methods_count > 0) {
-        if (direct_methods_count > 100000) goto fail_methods;  // 100K methods per class max
+        if (direct_methods_count > 50000) goto fail_methods;  // 50K direct methods per class max
         cd->direct_methods = (DxDexEncodedMethod *)dx_malloc(sizeof(DxDexEncodedMethod) * direct_methods_count);
         if (!cd->direct_methods) goto fail_methods;
         uint32_t method_idx = 0;
@@ -563,7 +587,7 @@ DxResult dx_dex_parse_class_data(DxDexFile *dex, uint32_t class_def_idx) {
 
     // Parse virtual methods
     if (virtual_methods_count > 0) {
-        if (virtual_methods_count > 100000) goto fail_methods;  // 100K methods per class max
+        if (virtual_methods_count > 50000) goto fail_methods;  // 50K virtual methods per class max
         cd->virtual_methods = (DxDexEncodedMethod *)dx_malloc(sizeof(DxDexEncodedMethod) * virtual_methods_count);
         if (!cd->virtual_methods) goto fail_methods;
         uint32_t method_idx = 0;
@@ -612,6 +636,17 @@ DxResult dx_dex_parse_code_item(const DxDexFile *dex, uint32_t offset, DxDexCode
         return DX_ERR_INVALID_FORMAT;
     }
 
+    // Validate insns_size doesn't extend past DEX file boundary (absolute check)
+    {
+        uint64_t insns_abs_end = (uint64_t)offset + 16 + (uint64_t)out->insns_size * 2;
+        if (insns_abs_end > dex->raw_size) {
+            DX_WARN(TAG, "Code item insns_size (%u) at offset 0x%x extends past DEX file boundary "
+                    "(insns end=0x%llx, file size=0x%x)",
+                    out->insns_size, offset, (unsigned long long)insns_abs_end, dex->raw_size);
+            return DX_ERR_INVALID_FORMAT;
+        }
+    }
+
     // Validate tries_size is within file bounds
     // tries array follows insns (with possible padding), each try_item is 8 bytes
     if (out->tries_size > 0) {
@@ -623,6 +658,27 @@ DxResult dx_dex_parse_code_item(const DxDexFile *dex, uint32_t offset, DxDexCode
             DX_WARN(TAG, "Code item tries_size (%u) exceeds file bounds at offset 0x%x",
                     out->tries_size, offset);
             return DX_ERR_INVALID_FORMAT;
+        }
+
+        // Validate each try_item: start_addr and insn_count must fall within insns_size
+        const uint8_t *try_base = dex->raw_data + insns_end;
+        uint32_t valid_tries = 0;
+        for (uint16_t t = 0; t < out->tries_size; t++) {
+            const uint8_t *entry = try_base + t * 8;
+            uint32_t start_addr = (uint32_t)entry[0] | ((uint32_t)entry[1] << 8) | ((uint32_t)entry[2] << 16) | ((uint32_t)entry[3] << 24);
+            uint16_t insn_count = (uint16_t)(entry[4] | (entry[5] << 8));
+            if (start_addr < out->insns_size &&
+                (uint64_t)start_addr + insn_count <= out->insns_size) {
+                valid_tries++;
+            } else {
+                DX_WARN(TAG, "Code item try_item[%u] at offset 0x%x: start_addr=%u insn_count=%u "
+                        "exceeds insns_size=%u",
+                        t, offset, start_addr, insn_count, out->insns_size);
+            }
+        }
+        if (valid_tries != out->tries_size) {
+            DX_WARN(TAG, "Code item at offset 0x%x: tries_size=%u but only %u try_items are valid",
+                    offset, out->tries_size, valid_tries);
         }
     }
 
@@ -749,7 +805,7 @@ DxResult dx_dex_parse_debug_info(const DxDexFile *dex, DxDexCodeItem *code) {
                 // Special opcode (0x0A - 0xFF)
                 int adjusted = opcode - 0x0A;
                 line += -4 + (adjusted % 15);
-                address += adjusted / 15;
+                address += (uint32_t)(adjusted / 15);
 
                 // Emit a line entry
                 if (count < DX_MAX_LINE_ENTRIES) {

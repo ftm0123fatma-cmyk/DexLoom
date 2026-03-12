@@ -65,6 +65,7 @@ const char *dx_result_string(DxResult result) {
         case DX_ERR_INTERNAL:           return "INTERNAL_ERROR";
         case DX_ERR_SIGNAL:            return "SIGNAL_CRASH";
         case DX_ERR_BUDGET_EXHAUSTED:  return "BUDGET_EXHAUSTED";
+        case DX_ERR_CANCELLED:         return "CANCELLED";
     }
     return "UNKNOWN";
 }

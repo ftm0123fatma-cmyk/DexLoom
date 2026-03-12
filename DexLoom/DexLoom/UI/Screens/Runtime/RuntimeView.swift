@@ -7,7 +7,24 @@ struct RuntimeView: View {
     var body: some View {
         NavigationStack {
             VStack(spacing: 0) {
-                if bridge.isRunning, let root = bridge.renderTree {
+                if bridge.isExecuting {
+                    // Interpreter is actively running on background thread
+                    VStack(spacing: 16) {
+                        ProgressView()
+                            .controlSize(.large)
+                        Text("Executing DEX bytecode...")
+                            .font(.dxBody)
+                            .foregroundStyle(Color.dxText)
+                        Button {
+                            bridge.cancelExecution()
+                        } label: {
+                            Label("Cancel Execution", systemImage: "xmark.circle.fill")
+                                .foregroundStyle(Color.red)
+                        }
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .background(Color.dxBackground)
+                } else if bridge.isRunning, let root = bridge.renderTree {
                     // Render the Android UI tree
                     ScrollView {
                         AndroidViewRenderer(node: root, bridge: bridge)

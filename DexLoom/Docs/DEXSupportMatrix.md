@@ -72,10 +72,10 @@ DexLoom includes a two-pass structural bytecode verifier (`dx_verifier.c`):
 | binop/lit16 | 0xD0-0xD7 | Real | add/rsub/mul/div/rem/and/or/xor |
 | binop/lit8 | 0xD8-0xE2 | Real | add/rsub/mul/div/rem/and/or/xor/shl/shr/ushr |
 | reserved | 0xE3-0xF9 | Default | Skipped by width |
-| invoke-polymorphic | 0xFA-0xFB | **Stub** | Returns null with warning |
+| invoke-polymorphic | 0xFA-0xFB | **Real** | MethodHandle.invoke/invokeExact with all 9 handle kinds |
 | invoke-custom | 0xFC-0xFD | **Real** | LambdaMetafactory + StringConcatFactory |
-| const-method-handle | 0xFE | **Stub** | Stores null |
-| const-method-type | 0xFF | **Stub** | Stores null |
+| const-method-handle | 0xFE | **Real** | Wraps DxMethodHandle in DxObject |
+| const-method-type | 0xFF | **Real** | Wraps DxDexProtoId in DxObject |
 
 ### invoke-custom Details
 - Parses call_site_item from DEX (method_handle_item + encoded_array)
@@ -147,16 +147,50 @@ All DEX instruction formats are supported:
 | Computed goto dispatch | 256-entry table, DISPATCH_NEXT macro |
 | Instruction budget | Per-call limit (500,000 instructions) with non-fatal exhaustion |
 | invoke-custom | LambdaMetafactory + StringConcatFactory |
+| invoke-polymorphic | MethodHandle.invoke/invokeExact, all 9 handle kinds (invoke-static/instance/direct/interface/constructor, iget/iput/sget/sput) |
+| const-method-handle/type | Real DxMethodHandle/DxDexProtoId wrapping |
+| Inline caching | 4-entry polymorphic IC per invoke-virtual call site, FIFO eviction |
+| Method inlining | Trivial getters (iget+return) and setters (iput+return-void) bypass frame creation |
+| Register file pinning | pinned_regs/pinned_code locals for interpreter hot path |
+| Interface method table | O(1) itable dispatch with default methods and diamond resolution |
+| Incremental GC | Mark stack + batched mark/sweep (256 objects/step) |
+| Custom ClassLoader | PathClassLoader, DexClassLoader, URLClassLoader with loadClass/getParent |
 | Bridge method handling | ACC_BRIDGE detection, non-bridge preferred |
+
+## Debug & Profiling Infrastructure
+
+| Feature | Details |
+|---------|---------|
+| Bytecode trace | Per-instruction logging with PC, opcode, register state; method prefix filter |
+| Class load trace | Logs every class loaded with source DEX file index |
+| Method call trace | Entry/exit logging with class, method name, depth, arg count |
+| Method profiling | total_time_ns + call_count per method, gated by profiling_enabled |
+| Opcode histogram | uint64_t[256] array, dx_vm_dump_opcode_stats() logs top 20 |
+| Hot method identification | dx_vm_dump_hot_methods() sorts by total_time_ns |
+| GC pause measurement | last_gc_pause_ns + total_gc_pause_ns, logged after each GC |
+| Allocation tracking | total_allocations + total_bytes_allocated counters |
+| Fuzzing harness | dx_fuzz_apk/dex/axml/resources entry points (libFuzzer-compatible) |
 
 ## Parser Hardening
 
 | Threat | Mitigation |
 |--------|------------|
 | Path traversal in ZIP entries | Reject `../` in filenames |
-| Zip bomb (decompression ratio) | Size limit checks |
-| AXML recursion depth | Hard limit on nesting |
+| Zip bomb (decompression ratio) | Size limit checks (>100:1 ratio rejected) |
+| Encrypted APK entries | General purpose bit flag detection with clear error |
+| ZIP64 archives | EOCD Locator + ZIP64 EOCD for 8-byte entry count and cd_offset |
+| Memory-mapped access | mmap/munmap for large APKs via dx_apk_open_file() |
+| APK signatures | V2/V3 scheme detection via "APK Sig Block 42" magic |
+| Split APKs | dx_apk_open_split() merges split entries into base |
+| AXML recursion depth | Hard limit on nesting (100 levels) |
+| AXML namespace | 3-tier resolution: namespace+name, resource ID, name-only fallback |
 | DEX offset validation | Bounds-checked before every table access |
+| DEX checksum | Adler32 validation via zlib adler32() over bytes 12..file_size |
+| DEX signature | SHA-1 validation via CommonCrypto CC_SHA1 over bytes 32..file_size |
+| DEX map section | map_list parsed into DxMapItem array |
+| DEX hidden API | Version 039+ detection with warning log |
 | Malformed bytecode | Structural verifier rejects invalid code |
 | Register index overflow | CHECK_REG macro on all instruction formats |
 | Code boundary overrun | Instruction boundary bitmap + CODE_AT macro |
+| File system access | Sandbox root enforcement, /proc/sys/dev rejection |
+| Crash isolation | SIGSEGV/SIGBUS signal handlers with sigsetjmp/siglongjmp recovery |

@@ -289,6 +289,7 @@ final class RuntimeBridge: ObservableObject {
     @Published var renderTree: RenderNode?
     @Published var isLoaded = false
     @Published var isRunning = false
+    @Published var isExecuting = false   // true while interpreter is actively running on background thread
     @Published var errorMessage: String?
     @Published var packageName: String?
     @Published var activityName: String?
@@ -510,14 +511,22 @@ final class RuntimeBridge: ObservableObject {
             return
         }
 
-        isRunning = true  // set immediately to prevent multiple taps
+        isRunning = true      // set immediately to prevent multiple taps
+        isExecuting = true    // show loading indicator while interpreter runs
         addLog(level: "INFO", tag: "Bridge", message: "Starting runtime execution")
+
+        // Clear any previous cancellation flag
+        if let vm = ctx.pointee.vm {
+            vm.pointee.cancel_requested = false
+        }
 
         Task.detached { [weak self] in
             let result = dx_context_run(ctx)
 
             await MainActor.run {
                 guard let self = self else { return }
+                self.isExecuting = false  // interpreter finished
+
                 if result == DX_OK {
                     self.addLog(level: "INFO", tag: "Bridge", message: "Runtime started successfully")
                     // Build initial render tree
@@ -528,6 +537,9 @@ final class RuntimeBridge: ObservableObject {
                     } else {
                         self.addLog(level: "WARN", tag: "Bridge", message: "No render model available (setContentView may not have been called)")
                     }
+                } else if result == DX_ERR_CANCELLED {
+                    self.isRunning = false
+                    self.addLog(level: "INFO", tag: "Bridge", message: "Execution cancelled by user")
                 } else {
                     self.isRunning = false
                     let errStr = String(cString: dx_result_string(result))
@@ -550,6 +562,14 @@ final class RuntimeBridge: ObservableObject {
                 }
             }
         }
+    }
+
+    /// Request cancellation of the currently executing interpreter.
+    /// The interpreter checks this flag every 10000 instructions and stops gracefully.
+    func cancelExecution() {
+        guard let ctx = context, let vm = ctx.pointee.vm, isExecuting else { return }
+        addLog(level: "INFO", tag: "Bridge", message: "Cancellation requested")
+        vm.pointee.cancel_requested = true
     }
 
     /// Refresh render tree with 60fps throttle. Skips if less than 16ms since last refresh
@@ -663,12 +683,17 @@ final class RuntimeBridge: ObservableObject {
     }
 
     func shutdown() {
+        // If interpreter is still running, request cancellation first
+        if isExecuting, let ctx = context, let vm = ctx.pointee.vm {
+            vm.pointee.cancel_requested = true
+        }
         if let ctx = context {
             dx_runtime_shutdown(ctx)
             context = nil
         }
         isLoaded = false
         isRunning = false
+        isExecuting = false
         renderTree = nil
     }
 
@@ -1157,6 +1182,29 @@ final class RuntimeBridge: ObservableObject {
             let ts = Self.logDateFormatter.string(from: entry.timestamp)
             return "[\(ts)] [\(entry.level)] \(entry.tag): \(entry.message)"
         }.joined(separator: "\n")
+    }
+
+    // MARK: - Telemetry
+
+    /// Enable or disable opt-in telemetry counters in the VM.
+    func setTelemetryEnabled(_ enabled: Bool) {
+        guard let ctx = context, let vm = ctx.pointee.vm else { return }
+        dx_vm_set_telemetry_enabled(vm, enabled)
+    }
+
+    /// Read a snapshot of the VM telemetry counters as a Swift dictionary.
+    func getTelemetry() -> [String: Any] {
+        guard let ctx = context, let vm = ctx.pointee.vm else { return [:] }
+        let t = dx_vm_get_telemetry(vm)
+        return [
+            "totalInstructionsExecuted": t.total_instructions_executed,
+            "totalGCCollections":        t.total_gc_collections,
+            "totalGCPauseNs":            t.total_gc_pause_ns,
+            "totalMethodsInvoked":       t.total_methods_invoked,
+            "classesLoaded":             t.classes_loaded,
+            "exceptionsThrown":          t.exceptions_thrown,
+            "telemetryEnabled":          t.telemetry_enabled,
+        ]
     }
 
     // MARK: - Private

@@ -100,7 +100,27 @@ struct HomeView: View {
                                 .font(.dxBody)
                         }
 
-                        if bridge.isLoaded && !bridge.isRunning {
+                        if bridge.isExecuting {
+                            VStack(spacing: 8) {
+                                ProgressView()
+                                    .controlSize(.large)
+                                Text("Executing DEX bytecode...")
+                                    .font(.dxCaption)
+                                    .foregroundStyle(Color.dxTextSecondary)
+                                Button {
+                                    bridge.cancelExecution()
+                                } label: {
+                                    Label("Cancel", systemImage: "xmark.circle.fill")
+                                        .frame(maxWidth: .infinity)
+                                        .padding()
+                                        .background(Color.red.opacity(0.15))
+                                        .foregroundStyle(Color.red)
+                                        .clipShape(RoundedRectangle(cornerRadius: 10))
+                                        .font(.dxBody)
+                                }
+                            }
+                            .padding(.vertical, 8)
+                        } else if bridge.isLoaded && !bridge.isRunning {
                             Button {
                                 bridge.run()
                             } label: {

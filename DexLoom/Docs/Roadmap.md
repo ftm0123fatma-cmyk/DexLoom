@@ -54,19 +54,30 @@
 - Varargs method invocation (pack_varargs)
 - Null-safe instance-of/check-cast
 - invoke-custom: Real LambdaMetafactory + StringConcatFactory
+- invoke-polymorphic: MethodHandle.invoke/invokeExact with all 9 handle kinds
+- const-method-handle / const-method-type: real DxMethodHandle/DxDexProtoId wrapping
+- Inline caching for invoke-virtual (4-entry polymorphic IC, FIFO eviction)
+- Method inlining for trivial getters/setters (bypass frame creation)
+- Register file pinning for interpreter hot path
+- Interface method table (itable) for O(1) interface dispatch with default methods
+- Incremental GC with mark stack (256 objects/step batched phases)
+- Custom ClassLoader support (PathClassLoader, DexClassLoader, URLClassLoader)
+- Volatile field semantics (ACC_VOLATILE + __sync_synchronize barriers)
 - Bytecode verifier: structural verification (boundaries, registers, indices, branches, payloads)
-- **Delivered**: Full interpreter with production-grade opcode coverage and verification
+- **Delivered**: Full interpreter with production-grade opcode coverage, optimization, and verification
 
-### Milestone 6: Android UI Rendering -- MOSTLY ACHIEVED
+### Milestone 6: Android UI Rendering -- ACHIEVED
 - Layout XML parsing (binary XML)
 - 30+ view types: TextView, Button, EditText, ImageView, RecyclerView, ListView, GridView, Spinner, SeekBar, RatingBar, RadioButton/Group, FAB, TabLayout, ViewPager, WebView, Chip, BottomNav, SwipeRefreshLayout
-- ConstraintLayout basic solver (12 constraint attributes, GeometryReader positioning)
-- Drawable loading from APK (PNG/JPEG extraction, UIImage rendering)
-- Vector drawable support (AXML path data to SVG parser to SwiftUI Canvas)
-- Dimension conversion with padding/margin support
+- ConstraintLayout solver with guidelines, chains (spread/spread_inside/packed), bias
+- Drawable loading: PNG/JPEG, vector (AXML->SVG->Canvas), 9-patch, StateListDrawable, LayerDrawable, ShapeDrawable
+- Measure/layout pass: dx_ui_measure() with match_parent/wrap_content/fixed dp resolution
+- Diff-based UI updates with dirty flags, version tracking, 60fps throttle
+- Lazy child rendering (LazyVStack/LazyHStack for 20+ children)
+- Focus management (focusable/focused state, auto-focus on EditText)
+- Property animation support (alpha, rotation, scaleX/scaleY, translationX/translationY)
 - WebView mapped to WKWebView bridge
-- **Still missing**: 9-patch PNG support, StateListDrawable, LayerDrawable, ShapeDrawable
-- **Delivered**: Rich UI rendering with 30+ view types and constraint solving
+- **Delivered**: Rich UI rendering with 30+ view types, constraint solving, and production-grade rendering pipeline
 
 ### Milestone 7: Activity Lifecycle & Navigation -- ACHIEVED
 - Full lifecycle: onCreate->onPostCreate->onStart->onResume->onPostResume + teardown
@@ -112,54 +123,78 @@
 - Error diagnostics (enhanced error reporting)
 - Build/VERSION constants: SDK_INT=33, RELEASE="13"
 - Line number tables from DEX debug_info_item
-- **Delivered**: Debug tooling for runtime inspection
+- Debug tracing: bytecode trace, class load trace, method call trace (per-method prefix filter)
+- In-app inspectors: DEX browser (searchable classes/methods/fields), manifest inspector, resource inspector
+- Profiling: method timing, opcode histogram, hot method ID, GC pause, allocation tracking
+- Crash report generation with ShareSheet export
+- Fuzzing harness (dx_fuzz_apk/dex/axml/resources, libFuzzer-compatible)
+- ASan CI job for memory sanitization
+- **Delivered**: Comprehensive debug, profiling, and security testing tooling
 
 ### Milestone 12: Networking -- ACHIEVED
 - java.net.HttpURLConnection: Real URLSession bridge for GET/POST/PUT/DELETE
 - Request headers, response headers, real response code + body as InputStream
 - javax.net.ssl.HttpsURLConnection extends HttpURLConnection + SSL stubs
 - OkHttp3: Request.Builder, Call.execute/enqueue, Response via real URLSession callback
-- **Delivered**: Real networking via iOS URLSession bridge
+- TCP Sockets: java.net.Socket/ServerSocket with real POSIX TCP (getaddrinfo/connect/accept)
+- Retrofit2: Annotation-driven dispatch with real HTTP via OkHttp + URLSession
+- **Delivered**: Real networking via iOS URLSession bridge + POSIX TCP sockets
 
 ## Test Coverage
 
-- **126 tests** covering parser hardening, DEX parsing, VM execution, framework classes, UI rendering, and integration scenarios
+- **147 tests** (26 suites) covering parser hardening, DEX parsing, VM execution, framework classes, UI rendering, and integration scenarios
 - Swift Testing framework with DexLoomTests target
+- GitHub Actions CI with iPhone + iPad simulator matrix
+- ASan CI job for memory sanitization
 
-## Current Feature Summary
+## Current Feature Summary (~84% of To-Do complete)
 
 ### Fully Supported
 - All 256 Dalvik opcodes with edge case handling (computed goto dispatch)
 - invoke-custom: Real LambdaMetafactory + StringConcatFactory
+- invoke-polymorphic: MethodHandle.invoke/invokeExact with all 9 handle kinds
+- const-method-handle / const-method-type: real values
 - Bytecode verifier: structural verification pass
 - 450+ framework classes (Android, Java, Kotlin, RxJava, OkHttp, Retrofit, Glide)
-- 30+ view types with ConstraintLayout basic solver
-- Full activity lifecycle with state save/restore and 16-deep back-stack
+- 30+ view types with ConstraintLayout solver (guidelines, chains, bias)
+- Measure/layout pass with match_parent/wrap_content resolution
+- Diff-based UI updates with 60fps throttle and lazy child rendering
+- Full activity lifecycle with state save/restore and 16-deep task/back stack
 - Fragment lifecycle, Service, BroadcastReceiver, ContentProvider
 - Reflection including Proxy, Constructor, annotations
 - JNI bridge (232 functions)
-- AssetManager, File I/O, permissions system
-- Touch events, menus, text input, long-press
-- Cooperative threading, LiveData/ViewModel
-- Real networking via URLSession (HttpURLConnection, OkHttp3)
-- Debug tools: UI tree inspector, heap inspector, error diagnostics
-- Mark-sweep GC with 5 root sets, string interning (8192 capacity)
+- AssetManager, File I/O, permissions system, file system sandboxing
+- Touch events, menus, text input, long-press, focus management
+- Cooperative threading, LiveData/ViewModel, Kotlin coroutines
+- Real networking via URLSession (HttpURLConnection, OkHttp3, Retrofit2)
+- TCP Sockets (java.net.Socket/ServerSocket with real POSIX networking)
+- Incremental GC with mark stack (256 objects/step batched phases)
+- Inline caching, method inlining, register file pinning
+- Interface method table (itable) for O(1) interface dispatch
+- Custom ClassLoader support, volatile field semantics
+- Property animation (alpha, rotation, scale, translation)
+- All drawable types: PNG/JPEG, vector, 9-patch, StateListDrawable, LayerDrawable, ShapeDrawable
+- Debug tracing (bytecode, class load, method call), profiling infrastructure
+- In-app inspectors: DEX browser, manifest inspector, resource inspector, UI tree, heap
+- APK hardening: ZIP bomb, CRC32, path traversal, encrypted, ZIP64, mmap, signatures, split APK
+- DEX hardening: Adler32, SHA-1, map parsing, hidden API detection
+- Resource cache with 512-entry FIFO eviction
+- Namespace-aware AXML attribute resolution
+- Fuzzing harness (libFuzzer-compatible) + ASan CI
 
 ### Known Limitations
 - Compose apps: fundamentally unsupported (need Compose compiler runtime)
 - JNI: Can't load .so files (no dlopen); provides env for DEX-side JNI calls only
 - Threading: cooperative (synchronous) only, no true concurrency
 - Multidex: supported (up to 8 DEX files)
-- 9-patch PNG, StateListDrawable, LayerDrawable: not yet implemented
-- invoke-polymorphic: stub (returns null with warning)
-- Socket/ServerSocket: not yet implemented
+- App Bundle (.aab): not supported (split APK is supported)
 - Obfuscated/heavily optimized APKs: may have issues
 
 ## Future Work
-- Split APK / App Bundle support
-- Fuzzing infrastructure
-- Performance benchmarking harness
-- ConstraintLayout guidelines and chains
-- Proper measure/layout pass (Android 2-pass model)
-- Incremental/generational GC
+- Generational GC (young/old generations)
 - Register type tracking in verifier
+- App Bundle (.aab) support
+- Core Graphics bridge for Canvas draw commands
+- AVAudioPlayer bridge for MediaPlayer
+- Opcode combination optimization (const/4 + if-eqz patterns)
+- NaN-boxing for DxValue size reduction

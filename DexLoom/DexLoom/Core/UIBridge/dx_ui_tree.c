@@ -27,6 +27,74 @@ static DxLayoutCacheEntry s_layout_cache[DX_LAYOUT_CACHE_SIZE];
 static uint32_t s_layout_cache_count = 0;
 static uint32_t s_layout_cache_next  = 0;  // FIFO write index
 
+// ── Hash index for O(1) resource-ID lookup into the FIFO cache ──
+// Maps resource_id -> index in s_layout_cache[] via open-addressing.
+// Sized at 2x cache to keep load factor ≤ 0.5.
+#define DX_LAYOUT_HASH_SIZE 64
+#define DX_LAYOUT_HASH_EMPTY UINT32_MAX
+
+typedef struct {
+    uint32_t resource_id;  // 0 = empty slot
+    uint32_t cache_idx;    // index into s_layout_cache[]
+} DxLayoutHashEntry;
+
+static DxLayoutHashEntry s_layout_hash[DX_LAYOUT_HASH_SIZE];
+
+static inline uint32_t dx_layout_hash_fn(uint32_t id) {
+    // FNV-1a-style mix for uint32
+    uint32_t h = 2166136261u;
+    h ^= id & 0xFF;         h *= 16777619u;
+    h ^= (id >> 8) & 0xFF;  h *= 16777619u;
+    h ^= (id >> 16) & 0xFF; h *= 16777619u;
+    h ^= (id >> 24) & 0xFF; h *= 16777619u;
+    return h % DX_LAYOUT_HASH_SIZE;
+}
+
+// Insert or update the hash index for a given resource_id -> cache_idx mapping.
+static void dx_layout_hash_put(uint32_t resource_id, uint32_t cache_idx) {
+    if (resource_id == 0) return;
+    uint32_t slot = dx_layout_hash_fn(resource_id);
+    for (uint32_t probe = 0; probe < DX_LAYOUT_HASH_SIZE; probe++) {
+        uint32_t idx = (slot + probe) % DX_LAYOUT_HASH_SIZE;
+        if (s_layout_hash[idx].resource_id == 0 ||
+            s_layout_hash[idx].resource_id == resource_id) {
+            s_layout_hash[idx].resource_id = resource_id;
+            s_layout_hash[idx].cache_idx   = cache_idx;
+            return;
+        }
+    }
+    // Table full (should never happen with load factor ≤ 0.5)
+}
+
+// Remove a resource_id from the hash index (called on eviction).
+static void dx_layout_hash_remove(uint32_t resource_id) {
+    if (resource_id == 0) return;
+    uint32_t slot = dx_layout_hash_fn(resource_id);
+    for (uint32_t probe = 0; probe < DX_LAYOUT_HASH_SIZE; probe++) {
+        uint32_t idx = (slot + probe) % DX_LAYOUT_HASH_SIZE;
+        if (s_layout_hash[idx].resource_id == resource_id) {
+            s_layout_hash[idx].resource_id = 0;
+            s_layout_hash[idx].cache_idx   = 0;
+            return;
+        }
+        if (s_layout_hash[idx].resource_id == 0) return; // not found
+    }
+}
+
+// Lookup in hash index. Returns cache index or DX_LAYOUT_HASH_EMPTY.
+static uint32_t dx_layout_hash_find(uint32_t resource_id) {
+    if (resource_id == 0) return DX_LAYOUT_HASH_EMPTY;
+    uint32_t slot = dx_layout_hash_fn(resource_id);
+    for (uint32_t probe = 0; probe < DX_LAYOUT_HASH_SIZE; probe++) {
+        uint32_t idx = (slot + probe) % DX_LAYOUT_HASH_SIZE;
+        if (s_layout_hash[idx].resource_id == resource_id) {
+            return s_layout_hash[idx].cache_idx;
+        }
+        if (s_layout_hash[idx].resource_id == 0) return DX_LAYOUT_HASH_EMPTY;
+    }
+    return DX_LAYOUT_HASH_EMPTY;
+}
+
 // Deep-clone a DxUINode tree (no listener/runtime_obj references are copied)
 static DxUINode *dx_ui_node_clone(const DxUINode *src) {
     if (!src) return NULL;
@@ -89,41 +157,51 @@ static DxUINode *dx_ui_node_clone(const DxUINode *src) {
 }
 
 // Look up a cached layout tree by resource ID. Returns a deep clone on hit, NULL on miss.
+// Uses hash index for O(1) lookup instead of linear scan.
 static DxUINode *dx_layout_cache_get(uint32_t resource_id) {
     if (resource_id == 0) return NULL;
-    for (uint32_t i = 0; i < s_layout_cache_count; i++) {
-        if (s_layout_cache[i].resource_id == resource_id && s_layout_cache[i].tree) {
-            DX_DEBUG(TAG, "Layout cache hit for resource 0x%08x", resource_id);
-            return dx_ui_node_clone(s_layout_cache[i].tree);
-        }
+
+    uint32_t ci = dx_layout_hash_find(resource_id);
+    if (ci != DX_LAYOUT_HASH_EMPTY && ci < s_layout_cache_count &&
+        s_layout_cache[ci].resource_id == resource_id && s_layout_cache[ci].tree) {
+        DX_DEBUG(TAG, "Layout cache hit for resource 0x%08x (hash)", resource_id);
+        return dx_ui_node_clone(s_layout_cache[ci].tree);
     }
     return NULL;
 }
 
 // Insert a layout tree into the cache (stores a deep clone).
+// Maintains hash index alongside FIFO cache for O(1) lookup.
 static void dx_layout_cache_put(uint32_t resource_id, const DxUINode *tree) {
     if (resource_id == 0 || !tree) return;
 
-    // Check for duplicate - update in place
-    for (uint32_t i = 0; i < s_layout_cache_count; i++) {
-        if (s_layout_cache[i].resource_id == resource_id) {
-            dx_ui_node_destroy(s_layout_cache[i].tree);
-            s_layout_cache[i].tree = dx_ui_node_clone(tree);
-            return;
-        }
+    // Check for duplicate via hash - update in place
+    uint32_t ci = dx_layout_hash_find(resource_id);
+    if (ci != DX_LAYOUT_HASH_EMPTY && ci < s_layout_cache_count &&
+        s_layout_cache[ci].resource_id == resource_id) {
+        dx_ui_node_destroy(s_layout_cache[ci].tree);
+        s_layout_cache[ci].tree = dx_ui_node_clone(tree);
+        return;
     }
 
     // FIFO eviction if full
     if (s_layout_cache_count >= DX_LAYOUT_CACHE_SIZE) {
+        // Remove evicted entry from hash index
+        dx_layout_hash_remove(s_layout_cache[s_layout_cache_next].resource_id);
         // Evict at s_layout_cache_next
         dx_ui_node_destroy(s_layout_cache[s_layout_cache_next].tree);
         s_layout_cache[s_layout_cache_next].resource_id = resource_id;
         s_layout_cache[s_layout_cache_next].tree = dx_ui_node_clone(tree);
+        // Update hash index
+        dx_layout_hash_put(resource_id, s_layout_cache_next);
         s_layout_cache_next = (s_layout_cache_next + 1) % DX_LAYOUT_CACHE_SIZE;
     } else {
         // Still have room
-        s_layout_cache[s_layout_cache_count].resource_id = resource_id;
-        s_layout_cache[s_layout_cache_count].tree = dx_ui_node_clone(tree);
+        uint32_t idx = s_layout_cache_count;
+        s_layout_cache[idx].resource_id = resource_id;
+        s_layout_cache[idx].tree = dx_ui_node_clone(tree);
+        // Update hash index
+        dx_layout_hash_put(resource_id, idx);
         s_layout_cache_count++;
         s_layout_cache_next = s_layout_cache_count % DX_LAYOUT_CACHE_SIZE;
     }
@@ -131,7 +209,7 @@ static void dx_layout_cache_put(uint32_t resource_id, const DxUINode *tree) {
     DX_DEBUG(TAG, "Layout cache store for resource 0x%08x (count=%u)", resource_id, s_layout_cache_count);
 }
 
-// Flush the entire layout parse cache.
+// Flush the entire layout parse cache (and hash index).
 void dx_ui_cache_clear(void) {
     for (uint32_t i = 0; i < s_layout_cache_count; i++) {
         dx_ui_node_destroy(s_layout_cache[i].tree);
@@ -140,6 +218,7 @@ void dx_ui_cache_clear(void) {
     }
     s_layout_cache_count = 0;
     s_layout_cache_next = 0;
+    memset(s_layout_hash, 0, sizeof(s_layout_hash));
     DX_DEBUG(TAG, "Layout cache cleared");
 }
 
@@ -728,15 +807,31 @@ static DxRenderNode *serialize_node(DxUINode *node) {
     }
 
     if (node->child_count > 0) {
-        rn->children = (DxRenderNode *)dx_malloc(sizeof(DxRenderNode) * node->child_count);
-        rn->child_count = node->child_count;
-        for (uint32_t i = 0; i < node->child_count; i++) {
+        // Lazy child expansion: limit serialized children to DX_SERIALIZE_MAX_CHILDREN
+        // to avoid excessive memory/time on very large view hierarchies (>100 nodes)
+        #define DX_SERIALIZE_MAX_CHILDREN 100
+        uint32_t serialize_count = node->child_count;
+        rn->total_child_count = node->child_count;
+        if (serialize_count > DX_SERIALIZE_MAX_CHILDREN) {
+            serialize_count = DX_SERIALIZE_MAX_CHILDREN;
+            rn->has_more_children = true;
+            DX_DEBUG(TAG, "Lazy expansion: node %u has %u children, serializing first %u",
+                     node->view_id, node->child_count, serialize_count);
+        } else {
+            rn->has_more_children = false;
+        }
+        rn->children = (DxRenderNode *)dx_malloc(sizeof(DxRenderNode) * serialize_count);
+        rn->child_count = serialize_count;
+        for (uint32_t i = 0; i < serialize_count; i++) {
             DxRenderNode *child = serialize_node(node->children[i]);
             if (child) {
                 rn->children[i] = *child;
                 dx_free(child);
             }
         }
+    } else {
+        rn->total_child_count = 0;
+        rn->has_more_children = false;
     }
 
     return rn;

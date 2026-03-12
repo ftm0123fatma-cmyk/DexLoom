@@ -12,5 +12,6 @@
 #include "../Core/Include/dx_view.h"
 #include "../Core/Include/dx_runtime.h"
 #include "../Core/Include/dx_memory.h"
+#include "../Core/Include/dx_arena.h"
 
 #endif

@@ -5,6 +5,7 @@
 #include <stdio.h>
 
 #define TAG "Resources"
+#define DX_MAX_RESOURCES_SIZE  (100u * 1024u * 1024u)  // 100 MB limit for resources.arsc
 
 #include "../Include/dx_memory.h"
 
@@ -518,6 +519,10 @@ static float decode_float(uint32_t raw) {
 DxResult dx_resources_parse(const uint8_t *data, uint32_t size, DxResources **out) {
     if (!data || !out) return DX_ERR_NULL_PTR;
     if (size < 12) return DX_ERR_INVALID_FORMAT;
+    if (size > DX_MAX_RESOURCES_SIZE) {
+        DX_ERROR(TAG, "resources.arsc too large: %u bytes (limit %u)", size, DX_MAX_RESOURCES_SIZE);
+        return DX_ERR_INVALID_FORMAT;
+    }
 
     uint16_t type = read_u16(data);
     if (type != RES_TABLE_TYPE) {

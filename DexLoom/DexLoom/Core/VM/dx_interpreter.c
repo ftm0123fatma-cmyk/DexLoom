@@ -25,6 +25,10 @@ static uint64_t dx_current_time_ns(void) {
 
 #define TAG "Interp"
 
+// Superinstruction optimization: fuse common 2-instruction patterns
+// (e.g., const/4 + if-eqz) to avoid re-dispatch overhead.
+#define USE_SUPERINSTRUCTIONS 1
+
 // Computed goto (threaded dispatch) for interpreter speedup.
 // Uses GCC/Clang's &&label extension; falls back to switch on other compilers.
 #if defined(__GNUC__) || defined(__clang__)
@@ -102,9 +106,9 @@ static uint32_t find_catch_handler(DxVM *vm, DxFrame *frame, const uint16_t *ins
     for (uint16_t i = 0; i < tries_size; i++) {
         // Each try_item is 8 bytes: uint32_t start_addr, uint16_t insn_count, uint16_t handler_off
         const uint8_t *entry = try_data + (i * 8);
-        uint32_t start_addr = entry[0] | (entry[1] << 8) | (entry[2] << 16) | (entry[3] << 24);
-        uint16_t insn_count_val = entry[4] | (entry[5] << 8);
-        uint16_t handler_off = entry[6] | (entry[7] << 8);
+        uint32_t start_addr = (uint32_t)entry[0] | ((uint32_t)entry[1] << 8) | ((uint32_t)entry[2] << 16) | ((uint32_t)entry[3] << 24);
+        uint16_t insn_count_val = (uint16_t)(entry[4] | (entry[5] << 8));
+        uint16_t handler_off = (uint16_t)(entry[6] | (entry[7] << 8));
 
         if (throw_pc >= start_addr && throw_pc < start_addr + insn_count_val) {
             matched_handler_off = handler_off;
@@ -198,9 +202,9 @@ static uint32_t find_finally_handler(const uint16_t *insns, uint32_t insns_size,
     // Search all try_items covering this pc
     for (uint16_t i = 0; i < tries_size; i++) {
         const uint8_t *entry = try_data + (i * 8);
-        uint32_t start_addr = entry[0] | (entry[1] << 8) | (entry[2] << 16) | (entry[3] << 24);
-        uint16_t insn_count_val = entry[4] | (entry[5] << 8);
-        uint16_t handler_off = entry[6] | (entry[7] << 8);
+        uint32_t start_addr = (uint32_t)entry[0] | ((uint32_t)entry[1] << 8) | ((uint32_t)entry[2] << 16) | ((uint32_t)entry[3] << 24);
+        uint16_t insn_count_val = (uint16_t)(entry[4] | (entry[5] << 8));
+        uint16_t handler_off = (uint16_t)(entry[6] | (entry[7] << 8));
 
         if (pc >= start_addr && pc < start_addr + insn_count_val) {
             // Parse encoded_catch_handler to check for catch-all
@@ -1086,6 +1090,11 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
              method->declaring_class ? method->declaring_class->descriptor : "?",
              method->name, method->shorty ? method->shorty : "");
 
+    // Telemetry: count method invocations
+    if (vm->telemetry.telemetry_enabled) {
+        vm->telemetry.total_methods_invoked++;
+    }
+
     // Handle native methods
     if (method->is_native) {
         if (!method->native_fn) {
@@ -1142,8 +1151,19 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
         return DX_OK;
     }
 
+    // Validate code_item before using it — corrupt or missing insns pointer
+    // would cause immediate segfault in the hot path
+    if (!method->code.insns || method->code.insns_size == 0) {
+        DX_ERROR(TAG, "Method %s.%s has_code=true but insns is NULL or insns_size=0",
+                 method->declaring_class ? method->declaring_class->descriptor : "?",
+                 method->name ? method->name : "?");
+        if (_trace_method_active) vm->debug.trace_depth--;
+        return DX_ERR_VERIFICATION_FAILED;
+    }
+
     DxFrame *frame = dx_vm_alloc_frame(vm);
     if (!frame) return DX_ERR_OUT_OF_MEMORY;
+
     frame->method = method;
     frame->caller = vm->current_frame;
 
@@ -1489,6 +1509,20 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
             vm->opcode_histogram[code[pc] & 0xFF]++;
         }
 
+        // Cancellation: check every 10000 instructions (set from UI thread)
+        if (vm->cancel_requested && (vm->insn_count % 10000) == 0) {
+            const char *cls_desc = method->declaring_class ? method->declaring_class->descriptor : "?";
+            const char *mth_name = method->name ? method->name : "?";
+            DX_INFO(TAG, "Execution cancelled by user in %s.%s at pc=%u after %llu instructions",
+                    cls_desc, mth_name, pc, vm->insn_count);
+            snprintf(vm->error_msg, sizeof(vm->error_msg),
+                     "Execution cancelled by user in %s.%s at pc=%u",
+                     cls_desc, mth_name, pc);
+            exec_result = DX_ERR_CANCELLED;
+            if (result) *result = DX_NULL_VALUE;
+            goto done;
+        }
+
         // Watchdog: check wall-clock timeout every 10000 instructions
         if (vm->watchdog_timeout_ms > 0 && (vm->insn_count % 10000) == 0) {
             uint64_t now_ms = dx_current_time_ms();
@@ -1513,13 +1547,13 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
 
             // Build a trace of the last N instructions for debugging
             char trace_buf[512];
-            int tpos = 0;
-            tpos += snprintf(trace_buf + tpos, sizeof(trace_buf) - tpos,
+            size_t tpos = 0;
+            tpos += (size_t)snprintf(trace_buf + tpos, sizeof(trace_buf) - tpos,
                              "Last %d instructions before budget exhaustion:\n", INSN_TRACE_SIZE);
             uint32_t start = insn_trace_idx >= INSN_TRACE_SIZE ? insn_trace_idx - INSN_TRACE_SIZE : 0;
-            for (uint32_t ti = start; ti < insn_trace_idx && tpos < (int)sizeof(trace_buf) - 60; ti++) {
+            for (uint32_t ti = start; ti < insn_trace_idx && tpos < sizeof(trace_buf) - 60; ti++) {
                 uint32_t slot = ti % INSN_TRACE_SIZE;
-                tpos += snprintf(trace_buf + tpos, sizeof(trace_buf) - tpos,
+                tpos += (size_t)snprintf(trace_buf + tpos, sizeof(trace_buf) - tpos,
                                  "  pc=%u op=0x%02x (%s)\n",
                                  insn_trace[slot].pc, insn_trace[slot].opcode,
                                  dx_opcode_name(insn_trace[slot].opcode));
@@ -1835,6 +1869,29 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
             if (val & 0x8) val |= (int32_t)0xFFFFFFF0;
             pinned_regs[dst] = DX_INT_VALUE(val);
             pc += 1;
+
+#if USE_SUPERINSTRUCTIONS
+            // Superinstruction: const/4 vA, #+B followed by if-eqz vA, +CCCC
+            // Peek at next instruction and fuse if it's if-eqz on the same register
+            if (pc < code_size) {
+                uint16_t next_inst = code[pc];
+                uint8_t next_op = next_inst & 0xFF;
+                if (next_op == 0x38) { // if-eqz
+                    uint8_t eqz_reg = (next_inst >> 8) & 0xFF;
+                    if (eqz_reg == dst) {
+                        // Fused: skip re-dispatch, do the branch inline
+                        vm->insn_count++;
+                        vm->insn_total++;
+                        if (vm->profiling_enabled) {
+                            vm->opcode_histogram[0x38]++;
+                        }
+                        int16_t offset = (int16_t)code[pc + 1];
+                        pc = (uint32_t)((int32_t)pc + ((val == 0) ? (int32_t)offset : 2));
+                        DISPATCH_NEXT;
+                    }
+                }
+            }
+#endif
             DISPATCH_NEXT;
         }
 
@@ -2209,7 +2266,7 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
 #endif
             uint8_t arr_reg = (inst >> 8) & 0xFF;
             int32_t offset = (int32_t)(code[pc + 1] | ((uint32_t)code[pc + 2] << 16));
-            const uint16_t *payload = &code[pc + offset];
+            const uint16_t *payload = &code[(uint32_t)((int32_t)pc + offset)];
             uint16_t ident = payload[0];
             if (ident != 0x0300) {
                 DX_WARN(TAG, "fill-array-data: bad ident 0x%04x at pc=%u", ident, pc);
@@ -2259,6 +2316,11 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
             DxObject *exc = (pinned_regs[src].tag == DX_VAL_OBJ) ? pinned_regs[src].obj : NULL;
             const char *exc_class = exc && exc->klass ? exc->klass->descriptor : "unknown";
 
+            // Telemetry: count exceptions thrown
+            if (vm->telemetry.telemetry_enabled) {
+                vm->telemetry.exceptions_thrown++;
+            }
+
             // Search for a try/catch handler covering this pc
             if (method->code.tries_size > 0) {
                 uint32_t handler_addr = find_catch_handler(vm, frame, code, code_size,
@@ -2283,7 +2345,7 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
         case 0x28: { // goto +AA (10t)
 #endif
             int8_t offset = (int8_t)((inst >> 8) & 0xFF);
-            pc += offset;
+            pc = (uint32_t)((int32_t)pc + offset);
             DISPATCH_NEXT;
         }
 
@@ -2293,7 +2355,7 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
         case 0x29: { // goto/16 +AAAA (20t)
 #endif
             int16_t offset = (int16_t)code[pc + 1];
-            pc += offset;
+            pc = (uint32_t)((int32_t)pc + offset);
             DISPATCH_NEXT;
         }
 
@@ -2303,7 +2365,7 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
         case 0x2A: { // goto/32 +AAAAAAAA (30t)
 #endif
             int32_t offset = (int32_t)(code[pc + 1] | ((uint32_t)code[pc + 2] << 16));
-            pc += offset;
+            pc = (uint32_t)((int32_t)pc + offset);
             DISPATCH_NEXT;
         }
 
@@ -2314,7 +2376,7 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
 #endif
             uint8_t test_reg = (inst >> 8) & 0xFF;
             int32_t offset = (int32_t)(code[pc + 1] | ((uint32_t)code[pc + 2] << 16));
-            uint32_t payload_pc = pc + offset;
+            uint32_t payload_pc = (uint32_t)((int32_t)pc + offset);
             if (payload_pc >= code_size) {
                 DX_WARN(TAG, "packed-switch: payload offset %u out of bounds (code_size=%u)", payload_pc, code_size);
                 pc += 3;
@@ -2334,7 +2396,7 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
             int32_t test_val = pinned_regs[test_reg].i;
             int32_t idx = test_val - first_key;
             if (idx >= 0 && (uint32_t)idx < size) {
-                pc += targets[idx];
+                pc = (uint32_t)((int32_t)pc + targets[idx]);
             } else {
                 pc += 3; // fall through
             }
@@ -2348,7 +2410,7 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
 #endif
             uint8_t test_reg = (inst >> 8) & 0xFF;
             int32_t offset = (int32_t)(code[pc + 1] | ((uint32_t)code[pc + 2] << 16));
-            uint32_t payload_pc = pc + offset;
+            uint32_t payload_pc = (uint32_t)((int32_t)pc + offset);
             if (payload_pc >= code_size) {
                 DX_WARN(TAG, "sparse-switch: payload offset %u out of bounds (code_size=%u)", payload_pc, code_size);
                 pc += 3;
@@ -2369,7 +2431,7 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
             bool found = false;
             for (uint16_t si = 0; si < size; si++) {
                 if (keys[si] == test_val) {
-                    pc += targets[si];
+                    pc = (uint32_t)((int32_t)pc + targets[si]);
                     found = true;
                     break;
                 }
@@ -2477,7 +2539,7 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
                 case 0x36: take = (va >  vb); break; // if-gt
                 case 0x37: take = (va <= vb); break; // if-le
             }
-            pc += take ? offset : 2;
+            pc = (uint32_t)((int32_t)pc + (take ? (int32_t)offset : 2));
             DISPATCH_NEXT;
         }
 
@@ -2509,7 +2571,7 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
                 case 0x3C: take = (val >  0); break; // if-gtz
                 case 0x3D: take = (val <= 0); break; // if-lez
             }
-            pc += take ? offset : 2;
+            pc = (uint32_t)((int32_t)pc + (take ? (int32_t)offset : 2));
             DISPATCH_NEXT;
         }
 
@@ -2672,6 +2734,14 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
                 DISPATCH_NEXT;
             }
 
+            // Corruption guard: validate object has a valid class pointer
+            if (!obj->klass) {
+                DX_WARN(TAG, "iget on corrupted object (null klass) at pc=%u", pc);
+                pinned_regs[dst] = (opcode == 0x54) ? DX_NULL_VALUE : DX_INT_VALUE(0);
+                pc += 2;
+                DISPATCH_NEXT;
+            }
+
             const char *fname = dx_dex_get_field_name(cur_dex, field_idx);
             DxValue val;
             DxResult fr = dx_vm_get_field(obj, fname, &val);
@@ -2681,6 +2751,30 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
                 pinned_regs[dst] = (opcode == 0x54) ? DX_NULL_VALUE : DX_INT_VALUE(0);
             }
             pc += 2;
+
+#if USE_SUPERINSTRUCTIONS
+            // Superinstruction: iget-object (0x54) followed by return-object (0x11)
+            // Optimizes trivial getter methods: return this.field
+            if (opcode == 0x54 && pc < code_size) {
+                uint16_t next_inst = code[pc];
+                uint8_t next_op = next_inst & 0xFF;
+                if (next_op == 0x11) { // return-object
+                    uint8_t ret_reg = (next_inst >> 8) & 0xFF;
+                    if (ret_reg == dst) {
+                        // Fused: skip re-dispatch, do the return inline
+                        vm->insn_count++;
+                        vm->insn_total++;
+                        if (vm->profiling_enabled) {
+                            vm->opcode_histogram[0x11]++;
+                        }
+                        frame->result = pinned_regs[dst];
+                        frame->has_result = true;
+                        if (result) *result = pinned_regs[dst];
+                        goto done;
+                    }
+                }
+            }
+#endif
             DISPATCH_NEXT;
         }
 
@@ -2720,6 +2814,13 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
                     exec_result = DX_ERR_INTERNAL;
                     goto done;
                 }
+                pc += 2;
+                DISPATCH_NEXT;
+            }
+
+            // Corruption guard: validate object has a valid class pointer
+            if (!obj->klass) {
+                DX_WARN(TAG, "iput on corrupted object (null klass) at pc=%u", pc);
                 pc += 2;
                 DISPATCH_NEXT;
             }
@@ -3567,9 +3668,9 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
 
             DxValue poly_result;
             poly_result = DX_NULL_VALUE;
-            int hr = dx_vm_invoke_method_handle(vm, mh_obj, call_args, call_argc, &poly_result);
+            DxResult hr = dx_vm_invoke_method_handle(vm, mh_obj, call_args, call_argc, &poly_result);
             if (hr != DX_OK) {
-                exec_result = (DxResult)hr;
+                exec_result = hr;
                 goto done;
             }
             frame->result = poly_result;
@@ -3624,9 +3725,9 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
 
             DxValue poly_result_r;
             poly_result_r = DX_NULL_VALUE;
-            int hr_r = dx_vm_invoke_method_handle(vm, mh_obj_r, range_call_args, (int)call_argc_r, &poly_result_r);
+            DxResult hr_r = dx_vm_invoke_method_handle(vm, mh_obj_r, range_call_args, (int)call_argc_r, &poly_result_r);
             if (hr_r != DX_OK) {
-                exec_result = (DxResult)hr_r;
+                exec_result = hr_r;
                 goto done;
             }
             frame->result = poly_result_r;
@@ -3829,13 +3930,13 @@ done:
         }
 
         // Build stack trace from frame chain
-        int spos = 0;
+        size_t spos = 0;
         vm->diag.stack_trace[0] = '\0';
         DxFrame *sf = frame;
         int depth = 0;
-        while (sf && depth < 32 && spos < (int)sizeof(vm->diag.stack_trace) - 80) {
+        while (sf && depth < 32 && spos < sizeof(vm->diag.stack_trace) - 80) {
             if (sf->method) {
-                spos += snprintf(vm->diag.stack_trace + spos,
+                spos += (size_t)snprintf(vm->diag.stack_trace + spos,
                                  sizeof(vm->diag.stack_trace) - spos,
                                  "    at %s.%s (pc=%u)\n",
                                  sf->method->declaring_class ? sf->method->declaring_class->descriptor : "?",

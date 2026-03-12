@@ -354,6 +354,24 @@ DxResult dx_apk_open(const uint8_t *data, uint32_t size, DxApkFile **out) {
     return DX_OK;
 }
 
+// --- AAB (Android App Bundle) detection ---
+
+void dx_apk_detect_aab(DxApkFile *apk) {
+    if (!apk) return;
+    for (uint32_t i = 0; i < apk->entry_count; i++) {
+        const char *name = apk->entries[i].filename;
+        if (name && strncmp(name, "base/dex/", 9) == 0) {
+            apk->is_aab = true;
+            DX_INFO(TAG, "AAB format detected (found %s)", name);
+            return;
+        }
+    }
+}
+
+bool dx_apk_is_aab(const DxApkFile *apk) {
+    return apk && apk->is_aab;
+}
+
 // --- Split APK support ---
 
 // Internal: parse ZIP central directory entries from a buffer into a caller-provided array.

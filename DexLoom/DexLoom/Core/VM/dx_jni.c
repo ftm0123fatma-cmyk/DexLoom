@@ -998,7 +998,7 @@ static void JNICALL jni_GetStringUTFRegion(JNIEnv *env, jstring str, jsize start
     size_t slen = strlen(val);
     if ((size_t)start >= slen) return;
     size_t copy_len = (size_t)len;
-    if (start + copy_len > slen) copy_len = slen - (size_t)start;
+    if ((size_t)start + copy_len > slen) copy_len = slen - (size_t)start;
     memcpy(buf, val + start, copy_len);
     buf[copy_len] = '\0';
 }

@@ -28,6 +28,9 @@ DxVM *dx_vm_create(DxContext *ctx) {
     vm->watchdog_timeout_ms = 10000;  // 10 seconds default
     vm->watchdog_start_time = 0;
     vm->watchdog_triggered = false;
+    vm->young_gen_count = 0;
+    vm->young_gen_threshold = 256;
+    vm->gc_cycle_count = 0;
     DX_INFO(TAG, "VM created (insn limit=%u, watchdog=%ums)", DX_MAX_INSTRUCTIONS, vm->watchdog_timeout_ms);
     return vm;
 }
@@ -41,6 +44,7 @@ void dx_vm_destroy(DxVM *vm) {
     for (uint32_t i = 0; i < vm->heap_count; i++) {
         if (vm->heap[i]) {
             dx_free(vm->heap[i]->fields);
+            dx_free(vm->heap[i]->string_data);
             dx_free(vm->heap[i]->array_elements);
             dx_free(vm->heap[i]);
         }
@@ -75,6 +79,11 @@ void dx_vm_destroy(DxVM *vm) {
             dx_free(vm->classes[i]->annotations);
             dx_free(vm->classes[i]);
         }
+    }
+
+    // Free per-DEX class_def caches
+    for (uint32_t d = 0; d < vm->dex_count; d++) {
+        dx_free(vm->class_def_cache[d]);
     }
 
     // Free pooled frames
@@ -114,7 +123,14 @@ DxResult dx_vm_load_dex(DxVM *vm, DxDexFile *dex) {
         vm->dex = dex;  // first DEX becomes primary
     }
     if (vm->dex_count < DX_MAX_DEX_FILES) {
-        vm->dex_files[vm->dex_count++] = dex;
+        uint32_t idx = vm->dex_count;
+        vm->dex_files[idx] = dex;
+        // Allocate class_def cache for O(1) lookup by class_def_index
+        if (dex->class_count > 0) {
+            vm->class_def_cache[idx] = (DxClass **)calloc(dex->class_count, sizeof(DxClass *));
+            vm->class_def_cache_size[idx] = dex->class_count;
+        }
+        vm->dex_count++;
         DX_INFO(TAG, "DEX %u loaded into VM: %u classes", vm->dex_count, dex->class_count);
     } else {
         DX_WARN(TAG, "Too many DEX files (max %d), skipping", DX_MAX_DEX_FILES);
@@ -386,9 +402,10 @@ static DxResult native_string_substring(DxVM *vm, DxFrame *frame, DxValue *args,
         return DX_OK;
     }
     int32_t sub_len = end - begin;
-    char *buf = (char *)dx_malloc(sub_len + 1);
+    if (sub_len < 0) { frame->result = DX_NULL_VALUE; frame->has_result = true; return DX_OK; }
+    char *buf = (char *)dx_malloc((size_t)sub_len + 1);
     if (!buf) { frame->result = DX_NULL_VALUE; frame->has_result = true; return DX_OK; }
-    memcpy(buf, s + begin, sub_len);
+    memcpy(buf, s + begin, (size_t)sub_len);
     buf[sub_len] = '\0';
     DxObject *str = dx_vm_create_string(vm, buf);
     dx_free(buf);
@@ -433,7 +450,7 @@ static DxResult native_string_lastindexof(DxVM *vm, DxFrame *frame, DxValue *arg
     int32_t s_len = (int32_t)strlen(s);
     int32_t last = -1;
     for (int32_t i = 0; i <= s_len - sub_len; i++) {
-        if (strncmp(s + i, sub, sub_len) == 0) last = i;
+        if (strncmp(s + i, sub, (size_t)sub_len) == 0) last = i;
     }
     frame->result = DX_INT_VALUE(last);
     frame->has_result = true;
@@ -484,9 +501,9 @@ static DxResult native_string_trim(DxVM *vm, DxFrame *frame, DxValue *args, uint
     while (*s && (*s == ' ' || *s == '\t' || *s == '\n' || *s == '\r')) s++;
     int32_t len = (int32_t)strlen(s);
     while (len > 0 && (s[len-1] == ' ' || s[len-1] == '\t' || s[len-1] == '\n' || s[len-1] == '\r')) len--;
-    char *buf = (char *)dx_malloc(len + 1);
+    char *buf = (char *)dx_malloc((size_t)len + 1);
     if (!buf) { frame->result = DX_NULL_VALUE; frame->has_result = true; return DX_OK; }
-    memcpy(buf, s, len);
+    memcpy(buf, s, (size_t)len);
     buf[len] = '\0';
     DxObject *str = dx_vm_create_string(vm, buf);
     dx_free(buf);
@@ -551,7 +568,7 @@ static DxResult native_string_replace(DxVM *vm, DxFrame *frame, DxValue *args, u
     }
     size_t rlen = strlen(replacement);
     size_t slen = strlen(s);
-    int count = 0;
+    size_t count = 0;
     const char *p = s;
     while ((p = strstr(p, target)) != NULL) { count++; p += tlen; }
     if (count == 0) {
@@ -559,7 +576,7 @@ static DxResult native_string_replace(DxVM *vm, DxFrame *frame, DxValue *args, u
         frame->has_result = true;
         return DX_OK;
     }
-    size_t new_len = slen + count * (rlen - tlen);
+    size_t new_len = slen - (count * tlen) + (count * rlen);
     char *buf = (char *)dx_malloc(new_len + 1);
     if (!buf) { frame->result = DX_NULL_VALUE; frame->has_result = true; return DX_OK; }
     char *dst = buf;
@@ -571,7 +588,7 @@ static DxResult native_string_replace(DxVM *vm, DxFrame *frame, DxValue *args, u
             dst += strlen(p);
             break;
         }
-        size_t chunk = found - p;
+        size_t chunk = (size_t)(found - p);
         memcpy(dst, p, chunk);
         dst += chunk;
         memcpy(dst, replacement, rlen);
@@ -655,14 +672,14 @@ static DxResult native_string_split(DxVM *vm, DxFrame *frame, DxValue *args, uin
     if (!list_cls) { frame->result = DX_NULL_VALUE; frame->has_result = true; return DX_OK; }
     DxObject *list = dx_vm_alloc_object(vm, list_cls);
     if (!list) { frame->result = DX_NULL_VALUE; frame->has_result = true; return DX_OK; }
-    DxValue *elements = (DxValue *)dx_malloc(sizeof(DxValue) * count);
+    DxValue *elements = (DxValue *)dx_malloc(sizeof(DxValue) * (size_t)count);
     if (!elements) { frame->result = DX_NULL_VALUE; frame->has_result = true; return DX_OK; }
     p = s;
     int idx = 0;
     while (idx < count - 1) {
         const char *found = strstr(p, delim);
         if (!found) break;
-        size_t chunk = found - p;
+        size_t chunk = (size_t)(found - p);
         char *part = (char *)dx_malloc(chunk + 1);
         if (part) {
             memcpy(part, p, chunk);
@@ -1009,11 +1026,9 @@ static DxResult native_sb_init(DxVM *vm, DxFrame *frame, DxValue *args, uint32_t
     (void)frame; (void)arg_count;
     DxObject *self = args[0].obj;
     if (self) {
-        // Store empty string as initial buffer
-        DxValue v;
-        v.tag = DX_VAL_OBJ;
-        v.obj = (DxObject *)(uintptr_t)dx_strdup("");
-        dx_vm_set_field(self, "buf", v);
+        // Store empty string as initial buffer in dedicated string_data field
+        dx_free(self->string_data);
+        self->string_data = dx_strdup("");
     }
     return DX_OK;
 }
@@ -1023,9 +1038,7 @@ static DxResult native_sb_append(DxVM *vm, DxFrame *frame, DxValue *args, uint32
     DxObject *self = args[0].obj;
     if (!self) { frame->result = DX_NULL_VALUE; frame->has_result = true; return DX_OK; }
 
-    DxValue buf_val;
-    dx_vm_get_field(self, "buf", &buf_val);
-    const char *existing = (const char *)(uintptr_t)buf_val.obj;
+    const char *existing = self->string_data;
     if (!existing) existing = "";
 
     const char *append_str = "";
@@ -1040,9 +1053,8 @@ static DxResult native_sb_append(DxVM *vm, DxFrame *frame, DxValue *args, uint32
             size_t len = strlen(existing) + strlen(tmp) + 1;
             char *combined = (char *)dx_malloc(len);
             snprintf(combined, len, "%s%s", existing, tmp);
-            dx_free((void *)existing);
-            DxValue v; v.tag = DX_VAL_OBJ; v.obj = (DxObject *)(uintptr_t)combined;
-            dx_vm_set_field(self, "buf", v);
+            dx_free(self->string_data);
+            self->string_data = combined;
             frame->result = DX_OBJ_VALUE(self);
             frame->has_result = true;
             return DX_OK;
@@ -1054,9 +1066,8 @@ static DxResult native_sb_append(DxVM *vm, DxFrame *frame, DxValue *args, uint32
     size_t len = strlen(existing) + strlen(append_str) + 1;
     char *combined = (char *)dx_malloc(len);
     snprintf(combined, len, "%s%s", existing, append_str);
-    dx_free((void *)existing);
-    DxValue v; v.tag = DX_VAL_OBJ; v.obj = (DxObject *)(uintptr_t)combined;
-    dx_vm_set_field(self, "buf", v);
+    dx_free(self->string_data);
+    self->string_data = combined;
 
     frame->result = DX_OBJ_VALUE(self);
     frame->has_result = true;
@@ -1068,9 +1079,7 @@ static DxResult native_sb_tostring(DxVM *vm, DxFrame *frame, DxValue *args, uint
     DxObject *self = args[0].obj;
     const char *buf = "";
     if (self) {
-        DxValue buf_val;
-        dx_vm_get_field(self, "buf", &buf_val);
-        const char *s = (const char *)(uintptr_t)buf_val.obj;
+        const char *s = self->string_data;
         if (s) buf = s;
     }
     DxObject *str = dx_vm_create_string(vm, buf);
@@ -1231,7 +1240,7 @@ static DxResult native_system_arraycopy(DxVM *vm, DxFrame *frame, DxValue *args,
 
     // Use memmove for overlapping regions (src and dst may be the same array)
     memmove(&dst->array_elements[dst_pos], &src->array_elements[src_pos],
-            sizeof(DxValue) * length);
+            sizeof(DxValue) * (size_t)length);
     DX_TRACE(TAG, "System.arraycopy: copied %d elements", length);
     return DX_OK;
 }
@@ -3855,6 +3864,130 @@ DxClass *dx_vm_find_class(DxVM *vm, const char *descriptor) {
     return NULL;
 }
 
+// ─── Class unloading (for hot-reload or memory pressure) ───
+
+DxResult dx_vm_unload_class(DxVM *vm, const char *descriptor) {
+    if (!vm || !descriptor) return DX_ERR_NULL_PTR;
+
+    // Find the class in the hash table
+    DxClass *cls = dx_vm_find_class(vm, descriptor);
+    if (!cls) {
+        DX_WARN(TAG, "Cannot unload class '%s': not found", descriptor);
+        return DX_ERR_CLASS_NOT_FOUND;
+    }
+
+    // Warn if any live heap objects are instances of this class
+    for (uint32_t i = 0; i < vm->heap_count; i++) {
+        if (vm->heap[i] && vm->heap[i]->klass == cls) {
+            DX_WARN(TAG, "Unloading class '%s' that still has live instances on the heap", descriptor);
+            break;
+        }
+    }
+
+    // 1. Remove from hash table (open-addressing with tombstone rehash)
+    uint32_t idx = 0;
+    {
+        // Find the slot
+        uint32_t h = 2166136261u;
+        for (const char *s = descriptor; *s; s++) {
+            h ^= (uint8_t)*s;
+            h *= 16777619u;
+        }
+        h &= (DX_CLASS_HASH_SIZE - 1);
+
+        bool found = false;
+        for (uint32_t i = 0; i < DX_CLASS_HASH_SIZE; i++) {
+            uint32_t slot = (h + i) & (DX_CLASS_HASH_SIZE - 1);
+            if (!vm->class_hash[slot].descriptor) break;
+            if (strcmp(vm->class_hash[slot].descriptor, descriptor) == 0) {
+                idx = slot;
+                found = true;
+                break;
+            }
+        }
+        if (!found) return DX_ERR_CLASS_NOT_FOUND;
+
+        // Clear the slot
+        vm->class_hash[idx].descriptor = NULL;
+        vm->class_hash[idx].cls = NULL;
+
+        // Rehash subsequent entries in the cluster to fill the gap
+        uint32_t hole = idx;
+        for (uint32_t i = 1; i < DX_CLASS_HASH_SIZE; i++) {
+            uint32_t next = (idx + i) & (DX_CLASS_HASH_SIZE - 1);
+            if (!vm->class_hash[next].descriptor) break;
+
+            // Compute the natural slot for this entry
+            uint32_t nh = 2166136261u;
+            for (const char *s = vm->class_hash[next].descriptor; *s; s++) {
+                nh ^= (uint8_t)*s;
+                nh *= 16777619u;
+            }
+            nh &= (DX_CLASS_HASH_SIZE - 1);
+
+            // Check if this entry needs to be moved (its natural position is at or before the hole)
+            // Using the "does the hole lie between the natural slot and the current slot" test
+            bool needs_move = false;
+            if (hole < next) {
+                needs_move = (nh <= hole || nh > next);
+            } else {
+                needs_move = (nh <= hole && nh > next);
+            }
+
+            if (needs_move) {
+                vm->class_hash[hole] = vm->class_hash[next];
+                vm->class_hash[next].descriptor = NULL;
+                vm->class_hash[next].cls = NULL;
+                hole = next;
+            }
+        }
+    }
+
+    // 2. Remove from vm->classes[] linear array
+    for (uint32_t i = 0; i < vm->class_count; i++) {
+        if (vm->classes[i] == cls) {
+            // Shift remaining entries down
+            for (uint32_t j = i; j < vm->class_count - 1; j++) {
+                vm->classes[j] = vm->classes[j + 1];
+            }
+            vm->classes[vm->class_count - 1] = NULL;
+            vm->class_count--;
+            break;
+        }
+    }
+
+    // 3. Free class memory
+    // Free method annotations, ic_tables, and code items
+    for (uint32_t m = 0; m < cls->direct_method_count; m++) {
+        dx_free(cls->direct_methods[m].annotations);
+        dx_free(cls->direct_methods[m].ic_table);
+        dx_dex_free_code_item(&cls->direct_methods[m].code);
+    }
+    for (uint32_t m = 0; m < cls->virtual_method_count; m++) {
+        dx_free(cls->virtual_methods[m].annotations);
+        dx_free(cls->virtual_methods[m].ic_table);
+        dx_dex_free_code_item(&cls->virtual_methods[m].code);
+    }
+    dx_free(cls->field_defs);
+    dx_free(cls->static_fields);
+    dx_free(cls->direct_methods);
+    dx_free(cls->virtual_methods);
+    dx_free(cls->vtable);
+    if (cls->itable) {
+        for (int it = 0; it < cls->itable_count; it++) {
+            dx_free(cls->itable[it].methods);
+        }
+        dx_free(cls->itable);
+    }
+    dx_free(cls->interfaces);
+    dx_free(cls->annotations);
+
+    DX_INFO(TAG, "Unloaded class: %s", descriptor);
+    dx_free(cls);
+
+    return DX_OK;
+}
+
 const DxAnnotationEntry *dx_class_get_annotation(DxClass *cls, const char *type_desc) {
     if (!cls || !type_desc || !cls->annotations) return NULL;
     for (uint32_t i = 0; i < cls->annotation_count; i++) {
@@ -3974,6 +4107,16 @@ DxResult dx_vm_load_class(DxVM *vm, const char *descriptor, DxClass **out) {
         return DX_ERR_CLASS_NOT_FOUND;
     }
 
+    // Check per-DEX class_def cache for O(1) hit on previously loaded class_def
+    if (vm->class_def_cache[found_dex_idx] &&
+        (uint32_t)found_idx < vm->class_def_cache_size[found_dex_idx] &&
+        vm->class_def_cache[found_dex_idx][found_idx]) {
+        cls = vm->class_def_cache[found_dex_idx][found_idx];
+        if (out) *out = cls;
+        loading_depth--;
+        return DX_OK;
+    }
+
     // Temporarily set vm->dex to the found DEX for parsing helpers
     DxDexFile *prev_dex = vm->dex;
     vm->dex = found_dex;
@@ -4033,6 +4176,11 @@ DxResult dx_vm_load_class(DxVM *vm, const char *descriptor, DxClass **out) {
 
             DxDexClassData *cd = found_dex->class_data[i];
             if (!cd) {
+                // Cache even classes with no class_data
+                if (vm->class_def_cache[found_dex_idx] &&
+                    i < vm->class_def_cache_size[found_dex_idx]) {
+                    vm->class_def_cache[found_dex_idx][i] = cls;
+                }
                 vm->dex = prev_dex;
                 if (out) *out = cls;
                 loading_depth--;
@@ -4143,12 +4291,29 @@ DxResult dx_vm_load_class(DxVM *vm, const char *descriptor, DxClass **out) {
                     bool overridden = false;
                     for (uint32_t v = 0; v < super_vtable_size; v++) {
                         if (cls->vtable[v] &&
-                            strcmp(cls->vtable[v]->name, method->name) == 0 &&
-                            strcmp(cls->vtable[v]->shorty, method->shorty) == 0) {
-                            cls->vtable[v] = method;
-                            method->vtable_idx = (int32_t)v;
-                            overridden = true;
-                            break;
+                            strcmp(cls->vtable[v]->name, method->name) == 0) {
+                            // Name matches — verify shorty (signature) also matches before overriding
+                            if (cls->vtable[v]->shorty && method->shorty &&
+                                strcmp(cls->vtable[v]->shorty, method->shorty) == 0) {
+                                cls->vtable[v] = method;
+                                method->vtable_idx = (int32_t)v;
+                                overridden = true;
+                                break;
+                            } else {
+                                // Name matches but signature differs — not a valid override.
+                                // Log warning for potential DEX inconsistency or method overload
+                                // that should not replace the vtable slot.
+                                DX_WARN(TAG, "vtable[%u] signature mismatch during override: "
+                                        "%s.%s (shorty=%s) vs %s.%s (shorty=%s)",
+                                        v,
+                                        cls->vtable[v]->declaring_class ?
+                                            cls->vtable[v]->declaring_class->descriptor : "?",
+                                        cls->vtable[v]->name,
+                                        cls->vtable[v]->shorty ? cls->vtable[v]->shorty : "null",
+                                        cls->descriptor ? cls->descriptor : "?",
+                                        method->name,
+                                        method->shorty ? method->shorty : "null");
+                            }
                         }
                     }
                     if (!overridden) {
@@ -4266,6 +4431,12 @@ DxResult dx_vm_load_class(DxVM *vm, const char *descriptor, DxClass **out) {
                     descriptor, cls->instance_field_count,
                     cls->direct_method_count, cls->virtual_method_count,
                     cls->annotation_count);
+
+            // Store in per-DEX class_def cache for O(1) re-lookup
+            if (vm->class_def_cache[found_dex_idx] &&
+                i < vm->class_def_cache_size[found_dex_idx]) {
+                vm->class_def_cache[found_dex_idx][i] = cls;
+            }
 
             vm->dex = prev_dex;
             if (out) *out = cls;
@@ -4479,6 +4650,7 @@ static void gc_incremental_step(DxVM *vm, int max_objects) {
             DxObject *obj = vm->heap[vm->gc_sweep_cursor];
             if (obj && !obj->gc_mark) {
                 dx_free(obj->fields);
+                dx_free(obj->string_data);
                 dx_free(obj->array_elements);
                 dx_free(obj);
                 vm->heap[vm->gc_sweep_cursor] = NULL;
@@ -4503,6 +4675,51 @@ static void gc_incremental_step(DxVM *vm, int max_objects) {
             vm->heap_count = write;
 
             gc_clear_weak_refs(vm);
+
+            // Post-sweep dangling pointer scrub for incremental GC
+            // Scrub frame registers
+            DxFrame *sf = vm->current_frame;
+            while (sf) {
+                if (sf->method && sf->method->has_code) {
+                    uint32_t rc = sf->method->code.registers_size;
+                    if (rc > DX_MAX_REGISTERS) rc = DX_MAX_REGISTERS;
+                    for (uint32_t r = 0; r < rc; r++) {
+                        if (sf->registers[r].tag == DX_VAL_OBJ &&
+                            sf->registers[r].obj &&
+                            !sf->registers[r].obj->gc_mark) {
+                            sf->registers[r] = DX_NULL_VALUE;
+                        }
+                    }
+                }
+                if (sf->result.tag == DX_VAL_OBJ &&
+                    sf->result.obj && !sf->result.obj->gc_mark) {
+                    sf->result = DX_NULL_VALUE;
+                    sf->has_result = false;
+                }
+                if (sf->exception && !sf->exception->gc_mark) {
+                    sf->exception = NULL;
+                }
+                sf = sf->caller;
+            }
+            // Scrub static fields
+            for (uint32_t ci = 0; ci < vm->class_count; ci++) {
+                DxClass *cls = vm->classes[ci];
+                if (!cls || !cls->static_fields) continue;
+                for (uint32_t fi = 0; fi < cls->static_field_count; fi++) {
+                    if (cls->static_fields[fi].tag == DX_VAL_OBJ &&
+                        cls->static_fields[fi].obj &&
+                        !cls->static_fields[fi].obj->gc_mark) {
+                        cls->static_fields[fi] = DX_NULL_VALUE;
+                    }
+                }
+            }
+            // Scrub activity instance and pending exception
+            if (vm->activity_instance && !vm->activity_instance->gc_mark) {
+                vm->activity_instance = NULL;
+            }
+            if (vm->pending_exception && !vm->pending_exception->gc_mark) {
+                vm->pending_exception = NULL;
+            }
 
             vm->gc_phase = DX_GC_IDLE;
             DX_INFO(TAG, "Incremental GC completed: %u -> %u objects (%u freed)",
@@ -4551,8 +4768,8 @@ static void gc_mark_ui_tree(DxUINode *node) {
     }
 }
 
-void dx_vm_gc(DxVM *vm) {
-    if (!vm) return;
+DxResult dx_vm_gc(DxVM *vm) {
+    if (!vm) return DX_ERR_NULL_PTR;
 
     uint64_t gc_start_ns = 0;
     if (vm->profiling_enabled) {
@@ -4630,6 +4847,7 @@ void dx_vm_gc(DxVM *vm) {
         } else {
             // Free this object
             dx_free(obj->fields);
+            dx_free(obj->string_data);
             dx_free(obj->array_elements);
             dx_free(obj);
         }
@@ -4646,7 +4864,79 @@ void dx_vm_gc(DxVM *vm) {
     // whose referents were swept
     gc_clear_weak_refs(vm);
 
-    DX_INFO(TAG, "GC completed: %u -> %u objects (%u freed)", before, write, before - write);
+    // ── Post-sweep dangling pointer scrub ──
+    // Validate that all object references in frame registers, static fields,
+    // and the UI tree still point to surviving (marked) heap objects.
+    // This guards against corruption if a reference was missed during marking.
+
+    // Scrub frame registers in the active call chain
+    DxFrame *scrub_frame = vm->current_frame;
+    while (scrub_frame) {
+        if (scrub_frame->method && scrub_frame->method->has_code) {
+            uint32_t reg_count = scrub_frame->method->code.registers_size;
+            if (reg_count > DX_MAX_REGISTERS) reg_count = DX_MAX_REGISTERS;
+            for (uint32_t r = 0; r < reg_count; r++) {
+                if (scrub_frame->registers[r].tag == DX_VAL_OBJ &&
+                    scrub_frame->registers[r].obj &&
+                    !scrub_frame->registers[r].obj->gc_mark) {
+                    DX_WARN(TAG, "GC: nulling dangling register v%u in frame %s.%s",
+                            r,
+                            scrub_frame->method->declaring_class ?
+                                scrub_frame->method->declaring_class->descriptor : "?",
+                            scrub_frame->method->name ? scrub_frame->method->name : "?");
+                    scrub_frame->registers[r] = DX_NULL_VALUE;
+                }
+            }
+        }
+        // Scrub frame result
+        if (scrub_frame->result.tag == DX_VAL_OBJ &&
+            scrub_frame->result.obj && !scrub_frame->result.obj->gc_mark) {
+            scrub_frame->result = DX_NULL_VALUE;
+            scrub_frame->has_result = false;
+        }
+        // Scrub frame exception
+        if (scrub_frame->exception && !scrub_frame->exception->gc_mark) {
+            scrub_frame->exception = NULL;
+        }
+        scrub_frame = scrub_frame->caller;
+    }
+
+    // Scrub static fields of all loaded classes
+    for (uint32_t c = 0; c < vm->class_count; c++) {
+        DxClass *cls = vm->classes[c];
+        if (!cls || !cls->static_fields) continue;
+        for (uint32_t f = 0; f < cls->static_field_count; f++) {
+            if (cls->static_fields[f].tag == DX_VAL_OBJ &&
+                cls->static_fields[f].obj &&
+                !cls->static_fields[f].obj->gc_mark) {
+                DX_WARN(TAG, "GC: nulling dangling static field %u in class %s",
+                        f, cls->descriptor ? cls->descriptor : "?");
+                cls->static_fields[f] = DX_NULL_VALUE;
+            }
+        }
+    }
+
+    // Scrub activity instance
+    if (vm->activity_instance && !vm->activity_instance->gc_mark) {
+        DX_WARN(TAG, "GC: nulling dangling activity_instance");
+        vm->activity_instance = NULL;
+    }
+
+    // Scrub pending exception
+    if (vm->pending_exception && !vm->pending_exception->gc_mark) {
+        DX_WARN(TAG, "GC: nulling dangling pending_exception");
+        vm->pending_exception = NULL;
+    }
+
+    // Reset young generation count: all survivors in a major GC become old
+    vm->young_gen_count = 0;
+    for (uint32_t i = 0; i < vm->heap_count; i++) {
+        if (vm->heap[i] && vm->heap[i]->generation == 0) {
+            vm->heap[i]->generation = 1;  // promote all surviving young to old
+        }
+    }
+
+    DX_INFO(TAG, "Major GC completed: %u -> %u objects (%u freed)", before, write, before - write);
 
     // Profiling: record GC pause time
     if (vm->profiling_enabled && gc_start_ns > 0) {
@@ -4657,12 +4947,19 @@ void dx_vm_gc(DxVM *vm) {
                 (double)pause_ns / 1000000.0,
                 (double)vm->total_gc_pause_ns / 1000000.0);
     }
+
+    return DX_OK;
 }
 
 DxObject *dx_vm_alloc_object(DxVM *vm, DxClass *cls) {
     if (!vm || !cls) return NULL;
 
-    // Trigger GC at 80% capacity
+    // Trigger minor GC when young generation exceeds threshold
+    if (vm->young_gen_count >= vm->young_gen_threshold) {
+        dx_vm_gc_minor(vm);
+    }
+
+    // Trigger major GC at 80% capacity
     if (vm->heap_count >= DX_MAX_HEAP_OBJECTS * 80 / 100) {
         dx_vm_gc(vm);
     }
@@ -4696,7 +4993,9 @@ DxObject *dx_vm_alloc_object(DxVM *vm, DxClass *cls) {
     obj->ref_count = 1;
     obj->heap_idx = vm->heap_count;
     obj->ui_node = NULL;
+    obj->string_data = NULL;
     obj->gc_mark = false;
+    obj->generation = 0;  // new objects start in young generation
     obj->is_array = false;
     obj->array_length = 0;
     obj->array_elements = NULL;
@@ -4710,6 +5009,7 @@ DxObject *dx_vm_alloc_object(DxVM *vm, DxClass *cls) {
     }
 
     vm->heap[vm->heap_count++] = obj;
+    vm->young_gen_count++;
 
     // Profiling: track allocation count and bytes
     if (vm->profiling_enabled) {
@@ -4727,7 +5027,12 @@ DxObject *dx_vm_alloc_object(DxVM *vm, DxClass *cls) {
 DxObject *dx_vm_alloc_array(DxVM *vm, uint32_t length) {
     if (!vm) return NULL;
 
-    // Trigger GC at 80% capacity
+    // Trigger minor GC when young generation exceeds threshold
+    if (vm->young_gen_count >= vm->young_gen_threshold) {
+        dx_vm_gc_minor(vm);
+    }
+
+    // Trigger major GC at 80% capacity
     if (vm->heap_count >= DX_MAX_HEAP_OBJECTS * 80 / 100) {
         dx_vm_gc(vm);
     }
@@ -4753,6 +5058,7 @@ DxObject *dx_vm_alloc_array(DxVM *vm, uint32_t length) {
     obj->heap_idx = vm->heap_count;
     obj->ui_node = NULL;
     obj->gc_mark = false;
+    obj->generation = 0;  // new arrays start in young generation
     obj->fields = NULL;
     obj->is_array = true;
     obj->array_length = length;
@@ -4769,6 +5075,7 @@ DxObject *dx_vm_alloc_array(DxVM *vm, uint32_t length) {
     }
 
     vm->heap[vm->heap_count++] = obj;
+    vm->young_gen_count++;
     DX_TRACE(TAG, "Allocated array[%u] (heap[%u])", length, obj->heap_idx);
     return obj;
 }
@@ -4880,12 +5187,9 @@ DxObject *dx_vm_create_string(DxVM *vm, const char *utf8) {
     DxObject *str = dx_vm_alloc_object(vm, vm->class_string);
     if (!str) return NULL;
 
-    // Store C string pointer in first field slot
-    // The pointer is cast through uintptr_t -> DxObject* for storage.
-    // dx_vm_get_string_value() reverses this cast.
+    // Store C string in dedicated string_data field (no pointer-cast abuse)
     char *dup = dx_strdup(utf8);
-    str->fields[0].tag = DX_VAL_OBJ;
-    str->fields[0].obj = (DxObject *)(uintptr_t)dup;
+    str->string_data = dup;
 
     // Add to intern table
     if (vm->interned_count < DX_MAX_INTERNED_STRINGS) {
@@ -4905,8 +5209,7 @@ DxObject *dx_vm_intern_string(DxVM *vm, const char *utf8) {
 const char *dx_vm_get_string_value(DxObject *str_obj) {
     if (!str_obj || !str_obj->klass) return NULL;
     if (strcmp(str_obj->klass->descriptor, "Ljava/lang/String;") != 0) return NULL;
-    if (!str_obj->fields) return NULL;
-    return (const char *)(uintptr_t)str_obj->fields[0].obj;
+    return str_obj->string_data;
 }
 
 DxMethod *dx_vm_resolve_method(DxVM *vm, uint32_t dex_method_idx) {
@@ -5174,8 +5477,8 @@ char *dx_vm_heap_stats(DxVM *vm) {
 
     // Build output
     char buf[2048];
-    int pos = 0;
-    pos += snprintf(buf + pos, sizeof(buf) - pos,
+    size_t pos = 0;
+    pos += (size_t)snprintf(buf + pos, sizeof(buf) - pos,
         "Heap Statistics:\n"
         "  Capacity:      %u slots\n"
         "  Used:          %u slots\n"
@@ -5189,10 +5492,10 @@ char *dx_vm_heap_stats(DxVM *vm) {
         allocs, frees, bytes);
 
     if (top_count > 0) {
-        pos += snprintf(buf + pos, sizeof(buf) - pos, "  Top classes by instance count:\n");
+        pos += (size_t)snprintf(buf + pos, sizeof(buf) - pos, "  Top classes by instance count:\n");
         for (uint32_t t = 0; t < top_count && t < HEAP_TOP_N; t++) {
             if (top[t].count == 0) break;
-            pos += snprintf(buf + pos, sizeof(buf) - pos,
+            pos += (size_t)snprintf(buf + pos, sizeof(buf) - pos,
                 "    %4u  %s\n", top[t].count, top[t].desc);
         }
     }
@@ -5209,9 +5512,9 @@ char *dx_vm_get_last_error_detail(DxVM *vm) {
     if (!vm || !vm->diag.has_error) return dx_strdup("(no error recorded)\n");
 
     char buf[4096];
-    int pos = 0;
+    size_t pos = 0;
 
-    pos += snprintf(buf + pos, sizeof(buf) - pos,
+    pos += (size_t)snprintf(buf + pos, sizeof(buf) - pos,
         "Error Detail:\n"
         "  Method:  %s\n"
         "  PC:      %u\n"
@@ -5223,49 +5526,49 @@ char *dx_vm_get_last_error_detail(DxVM *vm) {
 
     // Register snapshot
     if (vm->diag.reg_count > 0) {
-        pos += snprintf(buf + pos, sizeof(buf) - pos, "  Registers:\n");
+        pos += (size_t)snprintf(buf + pos, sizeof(buf) - pos, "  Registers:\n");
         for (uint32_t r = 0; r < vm->diag.reg_count && r < 16; r++) {
             DxValue v = vm->diag.registers[r];
             switch (v.tag) {
                 case DX_VAL_INT:
-                    pos += snprintf(buf + pos, sizeof(buf) - pos,
+                    pos += (size_t)snprintf(buf + pos, sizeof(buf) - pos,
                         "    v%-3u = int %d (0x%x)\n", r, v.i, (uint32_t)v.i);
                     break;
                 case DX_VAL_LONG:
-                    pos += snprintf(buf + pos, sizeof(buf) - pos,
+                    pos += (size_t)snprintf(buf + pos, sizeof(buf) - pos,
                         "    v%-3u = long %lld\n", r, (long long)v.l);
                     break;
                 case DX_VAL_FLOAT:
-                    pos += snprintf(buf + pos, sizeof(buf) - pos,
+                    pos += (size_t)snprintf(buf + pos, sizeof(buf) - pos,
                         "    v%-3u = float %f\n", r, v.f);
                     break;
                 case DX_VAL_DOUBLE:
-                    pos += snprintf(buf + pos, sizeof(buf) - pos,
+                    pos += (size_t)snprintf(buf + pos, sizeof(buf) - pos,
                         "    v%-3u = double %f\n", r, v.d);
                     break;
                 case DX_VAL_OBJ:
                     if (v.obj) {
-                        pos += snprintf(buf + pos, sizeof(buf) - pos,
+                        pos += (size_t)snprintf(buf + pos, sizeof(buf) - pos,
                             "    v%-3u = obj %s @%p\n", r,
                             v.obj->klass ? v.obj->klass->descriptor : "?",
                             (void *)v.obj);
                     } else {
-                        pos += snprintf(buf + pos, sizeof(buf) - pos,
+                        pos += (size_t)snprintf(buf + pos, sizeof(buf) - pos,
                             "    v%-3u = null\n", r);
                     }
                     break;
                 default:
-                    pos += snprintf(buf + pos, sizeof(buf) - pos,
+                    pos += (size_t)snprintf(buf + pos, sizeof(buf) - pos,
                         "    v%-3u = void\n", r);
                     break;
             }
-            if ((uint32_t)pos >= sizeof(buf) - 100) break;
+            if (pos >= sizeof(buf) - 100) break;
         }
     }
 
     // Stack trace
     if (vm->diag.stack_trace[0] != '\0') {
-        pos += snprintf(buf + pos, sizeof(buf) - pos,
+        pos += (size_t)snprintf(buf + pos, sizeof(buf) - pos,
             "  Stack Trace:\n%s", vm->diag.stack_trace);
     }
 
@@ -5279,7 +5582,7 @@ char *dx_vm_get_last_error_detail(DxVM *vm) {
             msg = dx_vm_get_string_value(msg_val.obj);
             if (!msg) msg = "";
         }
-        pos += snprintf(buf + pos, sizeof(buf) - pos,
+        pos += (size_t)snprintf(buf + pos, sizeof(buf) - pos,
             "  Exception: %s: %s\n", exc_desc, msg);
     }
 
@@ -5551,7 +5854,7 @@ DxResult dx_vm_invoke_custom(DxVM *vm, DxFrame *frame, uint32_t call_site_idx,
 
 // ─── invoke-polymorphic: MethodHandle dispatch ───
 
-int dx_vm_invoke_method_handle(DxVM *vm, DxObject *handle_obj, DxValue *args, int argc, DxValue *result) {
+DxResult dx_vm_invoke_method_handle(DxVM *vm, DxObject *handle_obj, DxValue *args, int argc, DxValue *result) {
     if (!vm || !handle_obj) {
         if (result) *result = DX_NULL_VALUE;
         return DX_OK;
@@ -5711,12 +6014,210 @@ int dx_vm_invoke_method_handle(DxVM *vm, DxObject *handle_obj, DxValue *args, in
     }
 }
 
+// ─── Minor GC: only collect young generation (generation 0) objects ───
+
+// Mark young-reachable objects: only traverse from roots into young objects,
+// but also mark young objects referenced by old objects (remembered set scan).
+static void gc_mark_object_young(DxObject *obj) {
+    if (!obj || obj->gc_mark) return;
+    if (obj->generation != 0) return;  // skip old generation objects
+    obj->gc_mark = true;
+
+    // Mark young objects referenced by instance fields
+    if (obj->fields && obj->klass) {
+        bool is_weak = gc_is_weak_ref_class(obj->klass);
+        for (uint32_t i = 0; i < obj->klass->instance_field_count; i++) {
+            if (is_weak && i == 0) continue;
+            if (obj->fields[i].tag == DX_VAL_OBJ && obj->fields[i].obj) {
+                gc_mark_object_young(obj->fields[i].obj);
+            }
+        }
+    }
+
+    // Mark young objects referenced by array elements
+    if (obj->is_array && obj->array_elements) {
+        for (uint32_t i = 0; i < obj->array_length; i++) {
+            if (obj->array_elements[i].tag == DX_VAL_OBJ && obj->array_elements[i].obj) {
+                gc_mark_object_young(obj->array_elements[i].obj);
+            }
+        }
+    }
+}
+
+// Scan old-generation objects for references to young objects (remembered set approximation)
+static void gc_scan_old_to_young(DxVM *vm) {
+    for (uint32_t i = 0; i < vm->heap_count; i++) {
+        DxObject *obj = vm->heap[i];
+        if (!obj || obj->generation != 1) continue;  // only scan old objects
+
+        // Check instance fields for references to young objects
+        if (obj->fields && obj->klass) {
+            for (uint32_t f = 0; f < obj->klass->instance_field_count; f++) {
+                if (obj->fields[f].tag == DX_VAL_OBJ && obj->fields[f].obj) {
+                    gc_mark_object_young(obj->fields[f].obj);
+                }
+            }
+        }
+
+        // Check array elements for references to young objects
+        if (obj->is_array && obj->array_elements) {
+            for (uint32_t e = 0; e < obj->array_length; e++) {
+                if (obj->array_elements[e].tag == DX_VAL_OBJ && obj->array_elements[e].obj) {
+                    gc_mark_object_young(obj->array_elements[e].obj);
+                }
+            }
+        }
+    }
+}
+
+DxResult dx_vm_gc_minor(DxVM *vm) {
+    if (!vm) return DX_ERR_NULL_PTR;
+
+    uint64_t gc_start_ns = 0;
+    if (vm->profiling_enabled) {
+        gc_start_ns = dx_vm_time_ns();
+    }
+
+    vm->gc_cycle_count++;
+
+    // Every 4th cycle, promote to a full (major) GC instead
+    if ((vm->gc_cycle_count % 4) == 0) {
+        DX_INFO(TAG, "Minor GC -> promoting to major GC (cycle %u)", vm->gc_cycle_count);
+        return dx_vm_gc(vm);
+    }
+
+    uint32_t before = vm->heap_count;
+    DX_TRACE(TAG, "Minor GC started: %u objects in heap, %u young", before, vm->young_gen_count);
+
+    // Clear gc_mark on young objects only
+    for (uint32_t i = 0; i < vm->heap_count; i++) {
+        if (vm->heap[i] && vm->heap[i]->generation == 0) {
+            vm->heap[i]->gc_mark = false;
+        }
+    }
+
+    // ── Mark phase: mark young objects reachable from roots ──
+
+    // Root 1: activity instance
+    if (vm->activity_instance) gc_mark_object_young(vm->activity_instance);
+
+    // Root 2: frame registers
+    DxFrame *frame = vm->current_frame;
+    while (frame) {
+        if (frame->method && frame->method->has_code) {
+            uint32_t reg_count = frame->method->code.registers_size;
+            if (reg_count > DX_MAX_REGISTERS) reg_count = DX_MAX_REGISTERS;
+            for (uint32_t r = 0; r < reg_count; r++) {
+                if (frame->registers[r].tag == DX_VAL_OBJ && frame->registers[r].obj) {
+                    gc_mark_object_young(frame->registers[r].obj);
+                }
+            }
+        }
+        if (frame->result.tag == DX_VAL_OBJ && frame->result.obj) {
+            gc_mark_object_young(frame->result.obj);
+        }
+        if (frame->exception) gc_mark_object_young(frame->exception);
+        frame = frame->caller;
+    }
+
+    // Root 3: static fields
+    for (uint32_t c = 0; c < vm->class_count; c++) {
+        DxClass *cls = vm->classes[c];
+        if (!cls || !cls->static_fields) continue;
+        for (uint32_t f = 0; f < cls->static_field_count; f++) {
+            if (cls->static_fields[f].tag == DX_VAL_OBJ && cls->static_fields[f].obj) {
+                gc_mark_object_young(cls->static_fields[f].obj);
+            }
+        }
+    }
+
+    // Root 4: interned strings
+    for (uint32_t i = 0; i < vm->interned_count; i++) {
+        if (vm->interned_strings[i].obj) {
+            gc_mark_object_young(vm->interned_strings[i].obj);
+        }
+    }
+
+    // Root 5: old-to-young references (remembered set scan)
+    gc_scan_old_to_young(vm);
+
+    // ── Sweep phase: free unmarked young objects, promote surviving young to old ──
+    uint32_t write = 0;
+    uint32_t freed = 0;
+    uint32_t promoted = 0;
+    vm->young_gen_count = 0;
+
+    for (uint32_t i = 0; i < vm->heap_count; i++) {
+        DxObject *obj = vm->heap[i];
+        if (!obj) continue;
+
+        if (obj->generation == 0 && !obj->gc_mark) {
+            // Young and unreachable: free it
+            dx_free(obj->fields);
+            dx_free(obj->string_data);
+            dx_free(obj->array_elements);
+            dx_free(obj);
+            freed++;
+        } else {
+            // Surviving young objects get promoted to old generation
+            if (obj->generation == 0) {
+                obj->generation = 1;
+                promoted++;
+            }
+            obj->heap_idx = write;
+            vm->heap[write++] = obj;
+        }
+    }
+
+    // Null out remaining slots
+    for (uint32_t i = write; i < vm->heap_count; i++) {
+        vm->heap[i] = NULL;
+    }
+    vm->heap_count = write;
+
+    // Post-sweep dangling pointer scrub for frame registers
+    DxFrame *sf = vm->current_frame;
+    while (sf) {
+        if (sf->method && sf->method->has_code) {
+            uint32_t reg_count = sf->method->code.registers_size;
+            if (reg_count > DX_MAX_REGISTERS) reg_count = DX_MAX_REGISTERS;
+            for (uint32_t r = 0; r < reg_count; r++) {
+                if (sf->registers[r].tag == DX_VAL_OBJ &&
+                    sf->registers[r].obj &&
+                    !sf->registers[r].obj->gc_mark && sf->registers[r].obj->generation == 0) {
+                    sf->registers[r] = DX_NULL_VALUE;
+                }
+            }
+        }
+        if (sf->result.tag == DX_VAL_OBJ &&
+            sf->result.obj && !sf->result.obj->gc_mark) {
+            sf->result = DX_NULL_VALUE;
+            sf->has_result = false;
+        }
+        if (sf->exception && !sf->exception->gc_mark) {
+            sf->exception = NULL;
+        }
+        sf = sf->caller;
+    }
+
+    DX_INFO(TAG, "Minor GC completed: %u -> %u objects (%u freed, %u promoted)",
+            before, vm->heap_count, freed, promoted);
+
+    if (vm->profiling_enabled && gc_start_ns > 0) {
+        uint64_t pause_ns = dx_vm_time_ns() - gc_start_ns;
+        vm->last_gc_pause_ns = pause_ns;
+        vm->total_gc_pause_ns += pause_ns;
+    }
+
+    return DX_OK;
+}
+
 // ─── GC collect (public entry point for memory-pressure handling) ───
 
-void dx_vm_gc_collect(DxVM *vm) {
-    if (!vm) return;
+DxResult dx_vm_gc_collect(DxVM *vm) {
+    if (!vm) return DX_ERR_NULL_PTR;
     DX_INFO(TAG, "GC collect triggered (memory pressure or manual)");
-    dx_vm_gc(vm);
+    return dx_vm_gc(vm);
 }
 
 // ─── Incremental GC public API ───
@@ -5757,12 +6258,12 @@ const char *dx_vm_get_missing_features(DxVM *vm) {
         return buf;
     }
 
-    int pos = 0;
-    pos += snprintf(buf + pos, sizeof(buf) - pos,
+    size_t pos = 0;
+    pos += (size_t)snprintf(buf + pos, sizeof(buf) - pos,
                     "Unsupported features encountered (%u):\n",
                     vm->missing_features.count);
-    for (uint32_t i = 0; i < vm->missing_features.count && pos < (int)sizeof(buf) - 140; i++) {
-        pos += snprintf(buf + pos, sizeof(buf) - pos,
+    for (uint32_t i = 0; i < vm->missing_features.count && pos < sizeof(buf) - 140; i++) {
+        pos += (size_t)snprintf(buf + pos, sizeof(buf) - pos,
                         "  - %s\n", vm->missing_features.features[i]);
     }
     return buf;
@@ -6021,4 +6522,23 @@ void dx_vm_dump_hot_methods(DxVM *vm, int top_n) {
             (double)vm->last_gc_pause_ns / 1000000.0,
             (double)vm->total_gc_pause_ns / 1000000.0);
     #undef MAX_PROFILED_METHODS
+}
+
+// ─── Telemetry ───
+
+DxTelemetry dx_vm_get_telemetry(DxVM *vm) {
+    DxTelemetry t = {0};
+    if (!vm) return t;
+    t = vm->telemetry;
+    // Also pull in counters that the VM already tracks natively
+    t.total_instructions_executed = vm->insn_total;
+    t.total_gc_pause_ns           = vm->total_gc_pause_ns;
+    t.total_gc_collections        = vm->gc_cycle_count;
+    t.classes_loaded              = vm->class_count;
+    return t;
+}
+
+void dx_vm_set_telemetry_enabled(DxVM *vm, bool enabled) {
+    if (!vm) return;
+    vm->telemetry.telemetry_enabled = enabled;
 }

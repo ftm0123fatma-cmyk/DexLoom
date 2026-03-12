@@ -2,6 +2,7 @@
 #define DX_DEX_H
 
 #include "dx_types.h"
+#include "dx_arena.h"
 
 // DEX file magic: "dex\n035\0" (or 037, 038, 039)
 #define DEX_MAGIC_SIZE 8
@@ -207,6 +208,9 @@ struct DxDexFile {
     // Call sites (from call_site_id_item section in map list)
     DxCallSite     *call_sites;
     uint32_t        call_site_count;
+
+    // Arena allocator for parse-time allocations (strings, string_data_offsets)
+    DxArena        *arena;
 };
 
 // Parse a DEX file from a buffer (buffer must remain valid)

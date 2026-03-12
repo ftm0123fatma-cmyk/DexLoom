@@ -21,6 +21,10 @@ void *dx_malloc(size_t size) {
     return ptr;
 }
 
+void *dx_calloc(size_t count, size_t size) {
+    return dx_malloc(count * size); // dx_malloc already zeroes memory
+}
+
 void *dx_realloc(void *ptr, size_t size) {
     void *new_ptr = realloc(ptr, size);
     if (!new_ptr && size > 0) {

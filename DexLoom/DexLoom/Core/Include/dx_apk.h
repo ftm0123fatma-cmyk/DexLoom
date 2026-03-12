@@ -22,6 +22,7 @@ typedef struct {
     size_t      mmap_size;      // size of mmap region (only valid if is_mmapped)
     bool        has_v2_sig;     // APK Signature Scheme V2 detected
     bool        has_v3_sig;     // APK Signature Scheme V3 detected
+    bool        is_aab;         // true if archive has AAB directory structure
 } DxApkFile;
 
 // Parse an APK (ZIP) file from a buffer
@@ -46,6 +47,12 @@ DxResult dx_apk_find_entry(const DxApkFile *apk, const char *path, const DxZipEn
 // Handles STORE (no compression) and DEFLATE
 DxResult dx_apk_extract_entry(const DxApkFile *apk, const DxZipEntry *entry,
                                uint8_t **out_data, uint32_t *out_size);
+
+// Check if the parsed archive uses AAB (Android App Bundle) directory layout
+bool dx_apk_is_aab(const DxApkFile *apk);
+
+// Detect AAB layout by scanning entries for base/dex/ paths; sets apk->is_aab
+void dx_apk_detect_aab(DxApkFile *apk);
 
 // Streaming extraction callback: called with each chunk of uncompressed data
 typedef void (*dx_stream_callback)(const uint8_t *chunk, uint32_t chunk_size, void *user_data);

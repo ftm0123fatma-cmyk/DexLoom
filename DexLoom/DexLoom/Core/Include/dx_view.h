@@ -293,6 +293,8 @@ typedef struct DxRenderNode {
 
     struct DxRenderNode *children;
     uint32_t     child_count;
+    uint32_t     total_child_count;  // total children in source node (may be > child_count)
+    bool         has_more_children;  // true if child_count < total_child_count (lazy expansion)
 } DxRenderNode;
 
 // Render model - complete UI snapshot for Swift

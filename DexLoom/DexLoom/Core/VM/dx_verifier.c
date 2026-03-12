@@ -156,7 +156,10 @@ static DxResult verify_branch_target(DxVerifyContext *vctx, uint32_t pc, int32_t
     }
     uint32_t target = (uint32_t)target64;
     if (!bitmap_test(vctx->insn_bitmap, target)) {
-        return verify_fail(vctx, "branch at pc=%u targets pc=%u which is not an instruction start",
+        // Target lands in the middle of a wide instruction (e.g., const-wide, goto/32,
+        // invoke, or a payload). This would cause the interpreter to decode garbage.
+        return verify_fail(vctx, "branch at pc=%u targets pc=%u which is not an instruction "
+                           "boundary (lands inside a wide/multi-unit instruction)",
                            pc, target);
     }
     return DX_OK;
@@ -410,7 +413,7 @@ static DxResult verify_regs_for_insn(DxVerifyContext *vctx, uint32_t pc) {
                                            op == 0x2B ? "packed-switch" : "sparse-switch",
                                            pc, target, payload_size);
                     }
-                    // Validate each switch target is a valid branch
+                    // Validate each switch target is a valid branch on an instruction boundary
                     if (op == 0x2B) {
                         // packed-switch targets start at target+4
                         for (uint16_t i = 0; i < size; i++) {
@@ -421,6 +424,12 @@ static DxResult verify_regs_for_insn(DxVerifyContext *vctx, uint32_t pc) {
                                 if (case_target < 0 || case_target >= vctx->code_size) {
                                     return verify_fail(vctx, "packed-switch at pc=%u: case %u target %lld out of bounds",
                                                        pc, i, (long long)case_target);
+                                }
+                                uint32_t ct = (uint32_t)case_target;
+                                if (!bitmap_test(vctx->insn_bitmap, ct)) {
+                                    return verify_fail(vctx, "packed-switch at pc=%u: case %u target pc=%u "
+                                                       "is not an instruction boundary (lands inside wide instruction)",
+                                                       pc, i, ct);
                                 }
                             }
                         }
@@ -435,6 +444,12 @@ static DxResult verify_regs_for_insn(DxVerifyContext *vctx, uint32_t pc) {
                                 if (case_target < 0 || case_target >= vctx->code_size) {
                                     return verify_fail(vctx, "sparse-switch at pc=%u: case %u target %lld out of bounds",
                                                        pc, i, (long long)case_target);
+                                }
+                                uint32_t ct = (uint32_t)case_target;
+                                if (!bitmap_test(vctx->insn_bitmap, ct)) {
+                                    return verify_fail(vctx, "sparse-switch at pc=%u: case %u target pc=%u "
+                                                       "is not an instruction boundary (lands inside wide instruction)",
+                                                       pc, i, ct);
                                 }
                             }
                         }

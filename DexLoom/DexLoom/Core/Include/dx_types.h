@@ -39,6 +39,7 @@ typedef enum {
     DX_ERR_INTERNAL,
     DX_ERR_SIGNAL,              // Recovered from SIGSEGV/SIGBUS via crash isolation
     DX_ERR_BUDGET_EXHAUSTED,    // Instruction budget exhausted (infinite loop watchdog)
+    DX_ERR_CANCELLED,           // Execution cancelled by user
 } DxResult;
 
 // Value types for the register file
@@ -154,5 +155,121 @@ typedef enum {
 #define DX_NULL_VALUE ((DxValue){.tag = DX_VAL_OBJ, .obj = NULL})
 #define DX_INT_VALUE(v) ((DxValue){.tag = DX_VAL_INT, .i = (v)})
 #define DX_OBJ_VALUE(o) ((DxValue){.tag = DX_VAL_OBJ, .obj = (o)})
+
+// ─── NaN-boxing representation ───────────────────────────────────────────────
+//
+// When USE_NANBOXING is defined, DxNanboxValue is a single uint64_t (8 bytes)
+// instead of the 16-byte tagged union DxValue.
+//
+// IEEE 754 double: sign(1) | exponent(11) | mantissa(52)
+// A quiet NaN has exponent = 0x7FF and mantissa bit 51 set.
+// We use the remaining bits to encode type tags and payloads.
+//
+// Encoding layout (MSB to LSB):
+//   Doubles:  any bit pattern that is NOT a NaN with our tag prefix
+//   Integers: 0x7FF8_0001_xxxx_xxxx  (lower 32 bits = int32_t value)
+//   Objects:  0x7FFC_xxxx_xxxx_xxxx  (lower 48 bits = pointer)
+//   Floats:   0x7FF8_0002_xxxx_xxxx  (lower 32 bits = float bits)
+//   Longs:    stored as heap-allocated int64_t* via OBJ tag (or two regs)
+//   Void:     0x7FF8_0000_0000_0000  (canonical quiet NaN, no payload)
+//
+#ifdef USE_NANBOXING
+
+#include <string.h>
+
+typedef uint64_t DxNanboxValue;
+
+// The quiet NaN base: exponent all-1s + quiet NaN bit (bit 51)
+#define DX_NANBOX_QNAN        UINT64_C(0x7FF8000000000000)
+
+// Tag constants (placed in bits 48..32 above the 32-bit payload)
+#define DX_NANBOX_TAG_VOID    UINT64_C(0x7FF8000000000000)
+#define DX_NANBOX_TAG_INT     UINT64_C(0x7FF8000100000000)
+#define DX_NANBOX_TAG_FLOAT   UINT64_C(0x7FF8000200000000)
+
+// Object pointer: bit 50 set (0x7FFC prefix), pointer in lower 48 bits
+#define DX_NANBOX_TAG_OBJ     UINT64_C(0x7FFC000000000000)
+
+// Masks
+#define DX_NANBOX_MASK_TAG    UINT64_C(0xFFFF000000000000)
+#define DX_NANBOX_MASK_SUBTAG UINT64_C(0xFFFFFFFF00000000)
+#define DX_NANBOX_MASK_PTR    UINT64_C(0x0000FFFFFFFFFFFF)
+#define DX_NANBOX_MASK_32     UINT64_C(0x00000000FFFFFFFF)
+
+// ── Type checks ──
+
+static inline bool DX_NANBOX_IS_DOUBLE(DxNanboxValue v) {
+    return (v & DX_NANBOX_QNAN) != DX_NANBOX_QNAN;
+}
+
+static inline bool DX_NANBOX_IS_VOID(DxNanboxValue v) {
+    return v == DX_NANBOX_TAG_VOID;
+}
+
+static inline bool DX_NANBOX_IS_INT(DxNanboxValue v) {
+    return (v & DX_NANBOX_MASK_SUBTAG) == DX_NANBOX_TAG_INT;
+}
+
+static inline bool DX_NANBOX_IS_FLOAT(DxNanboxValue v) {
+    return (v & DX_NANBOX_MASK_SUBTAG) == DX_NANBOX_TAG_FLOAT;
+}
+
+static inline bool DX_NANBOX_IS_OBJ(DxNanboxValue v) {
+    return (v & DX_NANBOX_MASK_TAG) == DX_NANBOX_TAG_OBJ;
+}
+
+// ── Packing ──
+
+static inline DxNanboxValue DX_NANBOX_PACK_DOUBLE(double d) {
+    DxNanboxValue v;
+    memcpy(&v, &d, sizeof(v));
+    return v;
+}
+
+static inline DxNanboxValue DX_NANBOX_PACK_INT(int32_t i) {
+    return DX_NANBOX_TAG_INT | ((DxNanboxValue)(uint32_t)i);
+}
+
+static inline DxNanboxValue DX_NANBOX_PACK_FLOAT(float f) {
+    uint32_t bits;
+    memcpy(&bits, &f, sizeof(bits));
+    return DX_NANBOX_TAG_FLOAT | (DxNanboxValue)bits;
+}
+
+static inline DxNanboxValue DX_NANBOX_PACK_OBJ(DxObject *obj) {
+    return DX_NANBOX_TAG_OBJ | ((DxNanboxValue)(uintptr_t)obj & DX_NANBOX_MASK_PTR);
+}
+
+static inline DxNanboxValue DX_NANBOX_PACK_VOID(void) {
+    return DX_NANBOX_TAG_VOID;
+}
+
+// ── Unpacking ──
+
+static inline double DX_NANBOX_UNPACK_DOUBLE(DxNanboxValue v) {
+    double d;
+    memcpy(&d, &v, sizeof(d));
+    return d;
+}
+
+static inline int32_t DX_NANBOX_UNPACK_INT(DxNanboxValue v) {
+    return (int32_t)(v & DX_NANBOX_MASK_32);
+}
+
+static inline float DX_NANBOX_UNPACK_FLOAT(DxNanboxValue v) {
+    uint32_t bits = (uint32_t)(v & DX_NANBOX_MASK_32);
+    float f;
+    memcpy(&f, &bits, sizeof(f));
+    return f;
+}
+
+static inline DxObject *DX_NANBOX_UNPACK_OBJ(DxNanboxValue v) {
+    return (DxObject *)(uintptr_t)(v & DX_NANBOX_MASK_PTR);
+}
+
+// ── Convenience: null object ──
+#define DX_NANBOX_NULL  DX_NANBOX_PACK_OBJ(NULL)
+
+#endif // USE_NANBOXING
 
 #endif // DX_TYPES_H

@@ -149,9 +149,13 @@ struct DxObject {
     uint32_t   ref_count;
     uint32_t   heap_idx;        // index in VM heap
     bool       gc_mark;         // used by mark-sweep GC
+    uint8_t    generation;      // 0 = young, 1 = old (generational GC)
 
     // For View objects: link to UI node
     DxUINode  *ui_node;
+
+    // String storage (owned; freed with object)
+    char      *string_data;     // UTF-8 C string for java.lang.String / StringBuilder buf
 
     // Array support
     bool       is_array;
@@ -170,6 +174,18 @@ struct DxFrame {
     DxObject  *exception;       // pending exception for try/catch handling
 };
 
+// ── Telemetry (opt-in) ──
+
+typedef struct {
+    uint64_t total_instructions_executed;
+    uint64_t total_gc_collections;
+    uint64_t total_gc_pause_ns;
+    uint64_t total_methods_invoked;
+    uint32_t classes_loaded;
+    uint32_t exceptions_thrown;
+    bool     telemetry_enabled;
+} DxTelemetry;
+
 // VM state
 #define DX_MAX_DEX_FILES 8
 
@@ -185,6 +201,11 @@ struct DxVM {
     DxDexFile *dex;              // primary DEX (for backwards compat)
     DxDexFile *dex_files[DX_MAX_DEX_FILES];
     uint32_t   dex_count;
+
+    // Per-DEX class cache: maps class_def_index -> already-loaded DxClass*
+    // Avoids re-parsing the same class_def on repeated load_class calls
+    DxClass  **class_def_cache[DX_MAX_DEX_FILES];  // lazily allocated per DEX
+    uint32_t   class_def_cache_size[DX_MAX_DEX_FILES];
 
     // Class table
     DxClass   *classes[DX_MAX_CLASSES];
@@ -273,6 +294,9 @@ struct DxVM {
     uint32_t watchdog_timeout_ms;   // 0 = disabled, default 10000 (10 s)
     bool     watchdog_triggered;
 
+    // Cancellation: set from another thread to stop execution gracefully
+    volatile bool cancel_requested; // checked every 10000 instructions alongside watchdog
+
     // Missing feature tracker
     DxMissingFeatures missing_features;
 
@@ -312,6 +336,11 @@ struct DxVM {
     uint32_t   gc_mark_stack_top;
     uint32_t   gc_sweep_cursor;       // current position in heap during incremental sweep
 
+    // Generational GC state
+    uint32_t   young_gen_count;      // number of young (generation 0) objects in heap
+    uint32_t   young_gen_threshold;  // minor GC trigger threshold (default 256)
+    uint32_t   gc_cycle_count;       // total GC cycles (used to schedule major GC)
+
     // Singleton ClassLoader object (returned by Class.getClassLoader())
     DxObject  *singleton_classloader;
 
@@ -328,6 +357,9 @@ struct DxVM {
     // Heap allocation profiling
     uint64_t   total_allocations;
     uint64_t   total_bytes_allocated;
+
+    // ── Telemetry (opt-in counters) ──
+    DxTelemetry telemetry;
 };
 
 // VM lifecycle
@@ -341,13 +373,15 @@ DxResult dx_vm_load_class(DxVM *vm, const char *descriptor, DxClass **out);
 DxResult dx_vm_init_class(DxVM *vm, DxClass *cls);
 DxClass *dx_vm_find_class(DxVM *vm, const char *descriptor);
 void     dx_vm_class_hash_insert(DxVM *vm, DxClass *cls);
+DxResult dx_vm_unload_class(DxVM *vm, const char *descriptor);
 
 // Framework class registration (called by dx_vm_register_framework_classes)
 DxResult dx_register_java_lang(DxVM *vm);
 DxResult dx_register_android_framework(DxVM *vm);
 
 // Garbage collection
-void      dx_vm_gc(DxVM *vm);
+DxResult  dx_vm_gc(DxVM *vm);
+DxResult  dx_vm_gc_minor(DxVM *vm);  // minor GC: only collect young generation objects
 void      dx_vm_gc_step(DxVM *vm);   // incremental GC step (processes up to 256 objects)
 
 // Object operations
@@ -386,14 +420,14 @@ DxResult dx_vm_invoke_custom(DxVM *vm, DxFrame *frame, uint32_t call_site_idx,
                               DxValue *args, uint32_t arg_count);
 
 // invoke-polymorphic (MethodHandle.invoke / invokeExact dispatch)
-int dx_vm_invoke_method_handle(DxVM *vm, DxObject *handle_obj, DxValue *args, int argc, DxValue *result);
+DxResult dx_vm_invoke_method_handle(DxVM *vm, DxObject *handle_obj, DxValue *args, int argc, DxValue *result);
 
 // Annotation lookup on class/method
 const DxAnnotationEntry *dx_class_get_annotation(DxClass *cls, const char *type_desc);
 const DxAnnotationEntry *dx_method_get_annotation(DxMethod *method, const char *type_desc);
 
 // Garbage collection — force a full mark-sweep cycle (e.g. on memory pressure)
-void dx_vm_gc_collect(DxVM *vm);
+DxResult dx_vm_gc_collect(DxVM *vm);
 
 // Diagnostics
 char *dx_vm_heap_stats(DxVM *vm);
@@ -432,5 +466,11 @@ void dx_method_analyze_inline(DxMethod *method);
 void dx_vm_set_profiling(DxVM *vm, bool enabled);
 void dx_vm_dump_opcode_stats(DxVM *vm);
 void dx_vm_dump_hot_methods(DxVM *vm, int top_n);
+
+/// Get a snapshot of the current telemetry counters.
+DxTelemetry dx_vm_get_telemetry(DxVM *vm);
+
+/// Enable or disable telemetry collection.
+void dx_vm_set_telemetry_enabled(DxVM *vm, bool enabled);
 
 #endif // DX_VM_H

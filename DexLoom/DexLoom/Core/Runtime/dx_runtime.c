@@ -67,9 +67,28 @@ DxResult dx_runtime_load(DxContext *ctx, const char *apk_path) {
         return res;
     }
 
+    // Detect AAB (Android App Bundle) format
+    dx_apk_detect_aab(apk);
+    if (dx_apk_is_aab(apk)) {
+        DX_INFO(TAG, "Android App Bundle (.aab) detected — using base/ paths");
+        // Check for resources.pb (protobuf) which we cannot parse
+        const DxZipEntry *pb_entry = NULL;
+        if (dx_apk_find_entry(apk, "base/resources.pb", &pb_entry) == DX_OK) {
+            DX_WARN(TAG, "AAB uses resources.pb (Protocol Buffers) — resource parsing not supported; "
+                    "string resources, themes, and layout IDs will be unavailable");
+        }
+    }
+
     // Extract and parse AndroidManifest.xml
     const DxZipEntry *manifest_entry = NULL;
     res = dx_apk_find_entry(apk, "AndroidManifest.xml", &manifest_entry);
+    // Fallback: AAB stores manifest at base/manifest/AndroidManifest.xml
+    if (res != DX_OK && dx_apk_is_aab(apk)) {
+        res = dx_apk_find_entry(apk, "base/manifest/AndroidManifest.xml", &manifest_entry);
+        if (res == DX_OK) {
+            DX_INFO(TAG, "Found manifest at AAB path: base/manifest/AndroidManifest.xml");
+        }
+    }
     if (res == DX_OK) {
         uint8_t *manifest_data = NULL;
         uint32_t manifest_size = 0;
@@ -157,15 +176,21 @@ DxResult dx_runtime_load(DxContext *ctx, const char *apk_path) {
     }
 
     // Extract layout XML files (including qualified dirs like res/layout-v26/)
+    // For AAB format, layouts are under base/res/layout/
     for (uint32_t i = 0; i < apk->entry_count; i++) {
         const char *name = apk->entries[i].filename;
         // Match res/layout/ or res/layout-*/ (qualified resource directories)
+        // Also match base/res/layout/ for AAB format
+        const char *res_prefix = name;
+        if (dx_apk_is_aab(apk) && strncmp(name, "base/", 5) == 0) {
+            res_prefix = name + 5;  // skip "base/" to normalize path matching
+        }
         bool is_layout = false;
-        if (strncmp(name, "res/layout", 10) == 0 &&
-            (name[10] == '/' || name[10] == '-') && strstr(name, ".xml")) {
+        if (strncmp(res_prefix, "res/layout", 10) == 0 &&
+            (res_prefix[10] == '/' || res_prefix[10] == '-') && strstr(name, ".xml")) {
             // For qualified dirs (res/layout-v26/foo.xml), only take if we don't
             // already have the same basename from res/layout/
-            if (name[10] == '/') {
+            if (res_prefix[10] == '/') {
                 is_layout = true;  // unqualified - always take
             } else {
                 // qualified - check if we already have this basename
@@ -292,23 +317,27 @@ DxResult dx_runtime_load(DxContext *ctx, const char *apk_path) {
         for (uint32_t i = 0; i < apk->entry_count; i++) {
             const char *name = apk->entries[i].filename;
             if (!name) continue;
-            // Must be under res/, end with .xml, and NOT be AndroidManifest or known non-layout dirs
-            if (strncmp(name, "res/", 4) != 0) continue;
+            // Must be under res/ (or base/res/ for AAB), end with .xml
+            const char *rp = name;
+            if (dx_apk_is_aab(apk) && strncmp(name, "base/", 5) == 0) {
+                rp = name + 5;
+            }
+            if (strncmp(rp, "res/", 4) != 0) continue;
             size_t nlen = strlen(name);
             if (nlen < 8 || strcmp(name + nlen - 4, ".xml") != 0) continue;
             // Skip known non-layout resource dirs
-            if (strncmp(name, "res/values", 10) == 0) continue;
-            if (strncmp(name, "res/color", 9) == 0) continue;
-            if (strncmp(name, "res/anim", 8) == 0) continue;
-            if (strncmp(name, "res/menu", 8) == 0) continue;
-            if (strncmp(name, "res/xml", 7) == 0) continue;
-            if (strncmp(name, "res/drawable", 12) == 0) continue;
-            if (strncmp(name, "res/mipmap", 10) == 0) continue;
-            if (strncmp(name, "res/navigation", 14) == 0) continue;
-            if (strncmp(name, "res/font", 8) == 0) continue;
-            if (strncmp(name, "res/raw", 7) == 0) continue;
-            if (strncmp(name, "res/interpolator", 16) == 0) continue;
-            if (strncmp(name, "res/transition", 14) == 0) continue;
+            if (strncmp(rp, "res/values", 10) == 0) continue;
+            if (strncmp(rp, "res/color", 9) == 0) continue;
+            if (strncmp(rp, "res/anim", 8) == 0) continue;
+            if (strncmp(rp, "res/menu", 8) == 0) continue;
+            if (strncmp(rp, "res/xml", 7) == 0) continue;
+            if (strncmp(rp, "res/drawable", 12) == 0) continue;
+            if (strncmp(rp, "res/mipmap", 10) == 0) continue;
+            if (strncmp(rp, "res/navigation", 14) == 0) continue;
+            if (strncmp(rp, "res/font", 8) == 0) continue;
+            if (strncmp(rp, "res/raw", 7) == 0) continue;
+            if (strncmp(rp, "res/interpolator", 16) == 0) continue;
+            if (strncmp(rp, "res/transition", 14) == 0) continue;
 
             uint8_t *layout_data = NULL;
             uint32_t layout_size = 0;
@@ -352,6 +381,7 @@ DxResult dx_runtime_load(DxContext *ctx, const char *apk_path) {
     // They will be freed in dx_context_destroy()
 
     // Collect all DEX file entries from APK
+    // For AAB format, DEX files are under base/dex/ (e.g. base/dex/classes.dex)
     const DxZipEntry *dex_entries[8];
     uint32_t dex_entry_count = 0;
 
@@ -362,6 +392,21 @@ DxResult dx_runtime_load(DxContext *ctx, const char *apk_path) {
             if (len >= 4 && strcmp(name + len - 4, ".dex") == 0) {
                 dex_entries[dex_entry_count++] = &apk->entries[i];
                 DX_INFO(TAG, "Found DEX file: %s", name);
+            }
+        }
+    }
+
+    // AAB fallback: look under base/dex/ if no top-level DEX files found
+    if (dex_entry_count == 0 && dx_apk_is_aab(apk)) {
+        DX_INFO(TAG, "No top-level DEX files, scanning AAB base/dex/ directory");
+        for (uint32_t i = 0; i < apk->entry_count && dex_entry_count < 8; i++) {
+            const char *name = apk->entries[i].filename;
+            if (name && strncmp(name, "base/dex/", 9) == 0) {
+                size_t len = strlen(name);
+                if (len >= 4 && strcmp(name + len - 4, ".dex") == 0) {
+                    dex_entries[dex_entry_count++] = &apk->entries[i];
+                    DX_INFO(TAG, "Found AAB DEX file: %s", name);
+                }
             }
         }
     }
